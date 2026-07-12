@@ -1,0 +1,2 @@
+# 使用 rustfmt 默认风格；仅锁定 edition 保证各环境格式一致
+edition = "2024"

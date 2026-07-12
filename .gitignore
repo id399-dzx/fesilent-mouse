@@ -1,0 +1,9 @@
+.DS_Store
+.codex/
+.tools/
+target/
+dist/
+logs/
+premium/
+*.log
+crates/app/icons/windows/*-source.png

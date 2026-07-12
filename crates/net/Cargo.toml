@@ -1,0 +1,30 @@
+[package]
+name = "ms-net"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ms-proto.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "net"] }
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+quinn.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
+rcgen.workspace = true
+sha2.workspace = true
+futures-util.workspace = true
+bytes.workspace = true
+mdns-sd.workspace = true
+socket2.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net", "sync", "io-util"] }
+uuid.workspace = true
+
+[lints]
+workspace = true

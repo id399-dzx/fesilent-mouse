@@ -1,0 +1,62 @@
+# MouseShare virtual workspace（结构见 DEVELOPMENT.md §6.1，命名见 SPEC.md §1）
+[workspace]
+resolver = "3"
+members = [
+    "crates/core",
+    "crates/proto",
+    "crates/net",
+    "crates/premium-api",
+    "crates/platform",
+    "crates/platform-windows",
+    "crates/platform-macos",
+    "crates/app",
+]
+
+[workspace.package]
+version = "0.1.2"
+edition = "2024"
+rust-version = "1.85"
+
+[workspace.dependencies]
+ms-core = { path = "crates/core" }
+ms-proto = { path = "crates/proto" }
+ms-net = { path = "crates/net" }
+ms-premium-api = { path = "crates/premium-api" }
+ms-platform = { path = "crates/platform" }
+ms-platform-windows = { path = "crates/platform-windows" }
+ms-platform-macos = { path = "crates/platform-macos" }
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "sync", "signal", "io-util"] }
+quinn = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pki-types = "1"
+rcgen = "0.13"
+sha2 = "0.10"
+futures-util = "0.3"
+bytes = "1"
+mdns-sd = "0.13"
+socket2 = "0.5"
+png = "0.17"
+zstd = "0.13"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+serde = { version = "1", features = ["derive"] }
+bincode = { version = "2", features = ["serde"] }
+proptest = "1"
+serde_json = "1"
+thiserror = "2"
+crossbeam-queue = "0.3"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# SPEC.md §7：unsafe 只允许出现在 platform-* crate（它们不继承本组 lints，单独配置）
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+
+[profile.release]
+lto = "thin"
+strip = true

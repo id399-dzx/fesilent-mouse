@@ -1,0 +1,52 @@
+[package]
+name = "ms-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "mouseshare"
+path = "src/main.rs"
+
+[dependencies]
+ms-core.workspace = true
+ms-proto.workspace = true
+ms-net.workspace = true
+ms-platform.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+# 托盘 + 设置窗口：tray-icon 托盘 + egui（glow 后端）+ winit 自管事件循环（不用 eframe，
+# 以便托盘事件直接 set_visible，不依赖刷新循环）。winit/glutin 是 eframe 同款，可交叉编译。
+tray-icon = "0.23"
+egui = { version = "0.32", features = ["default_fonts"] }
+egui_glow = { version = "0.32", features = ["winit"] }
+glutin = "0.32"
+glutin-winit = "0.5"
+winit = "0.30"
+png.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+ms-platform-macos.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+ms-platform-windows.workspace = true
+
+[dev-dependencies]
+uuid.workspace = true
+
+# GUI 的 GL 上下文创建（glutin）必须用 unsafe，隔离在 ui.rs 且每处有 SAFETY 论证。
+# 故本 crate 单独配 lints（同 platform-* crate），不继承 workspace 的 unsafe_code=deny。
+# 偏离 CLAUDE.md §5 已在 SPEC.md §7 注明（GUI 必需）。
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+undocumented_unsafe_blocks = "deny"
