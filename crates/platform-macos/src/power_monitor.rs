@@ -5,7 +5,7 @@
 
 use std::ffi::c_void;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 
 type IoConnect = u32;
@@ -41,9 +41,14 @@ unsafe extern "C" {
 unsafe extern "C" {
     fn CFRunLoopGetCurrent() -> CFRunLoopRef;
     fn CFRunLoopAddSource(rl: CFRunLoopRef, source: CFRunLoopSourceRef, mode: CFStringRef);
-    fn CFRunLoopRun();
-    fn CFRunLoopStop(rl: CFRunLoopRef);
+    fn CFRunLoopRemoveSource(rl: CFRunLoopRef, source: CFRunLoopSourceRef, mode: CFStringRef);
+    fn CFRunLoopRunInMode(
+        mode: CFStringRef,
+        seconds: f64,
+        return_after_source_handled: bool,
+    ) -> i32;
     static kCFRunLoopCommonModes: CFStringRef;
+    static kCFRunLoopDefaultMode: CFStringRef;
 }
 
 /// 回调集合。`on_sleep`/`on_wake` 在电源监听线程上下文被调用。
@@ -71,7 +76,7 @@ extern "C" fn power_callback(refcon: *mut c_void, _service: IoService, msg: u32,
 }
 
 pub struct PowerMonitor {
-    runloop: Arc<AtomicPtr<c_void>>,
+    stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -82,8 +87,8 @@ impl PowerMonitor {
         S: Fn() + Send + 'static,
         W: Fn() + Send + 'static,
     {
-        let runloop = Arc::new(AtomicPtr::new(std::ptr::null_mut()));
-        let runloop_slot = Arc::clone(&runloop);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = Arc::clone(&stop);
 
         let thread = std::thread::Builder::new()
             .name("ms-mac-power".into())
@@ -108,17 +113,26 @@ impl PowerMonitor {
                 }
                 cbs.connect = connect;
 
-                // SAFETY: port 有效，挂到当前线程 run loop
-                unsafe {
-                    let source = IONotificationPortGetRunLoopSource(port);
-                    let rl = CFRunLoopGetCurrent();
-                    runloop_slot.store(rl, Ordering::Release);
-                    CFRunLoopAddSource(rl, source, kCFRunLoopCommonModes);
+                // 线程初始化可能晚于 Drop。取消位不依赖 run loop 指针先发布，避免
+                // Drop 读到空指针后 join，而工作线程随后进入永久 CFRunLoopRun。
+                // SAFETY: port 是注册得到的通知端口；run loop 属于当前线程。
+                let (source, rl) = unsafe {
+                    (IONotificationPortGetRunLoopSource(port), CFRunLoopGetCurrent())
+                };
+                if !source.is_null() {
+                    // SAFETY: rl/source/常量模式均有效；source 的所有权仍归 port。
+                    unsafe { CFRunLoopAddSource(rl, source, kCFRunLoopCommonModes) };
+                    tracing::info!(target: "mouseshare::mac", "电源事件监听已启动");
+                    while !stop_thread.load(Ordering::Acquire) {
+                        // SAFETY: 当前线程轮询默认模式；common source 包含在默认模式中。
+                        // 最多阻塞 100ms，既响应取消，也不跨线程使用未保留的 CF 指针。
+                        unsafe { CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.1, false) };
+                    }
+                    // SAFETY: 在销毁 port 前移除其 source，句柄尚有效。
+                    unsafe { CFRunLoopRemoveSource(rl, source, kCFRunLoopCommonModes) };
+                } else {
+                    tracing::error!(target: "mouseshare::mac", "电源通知端口未提供 run loop source");
                 }
-                tracing::info!(target: "mouseshare::mac", "电源事件监听已启动");
-
-                // SAFETY: 阻塞运行直到 stop 调用 CFRunLoopStop
-                unsafe { CFRunLoopRun() };
 
                 // 清理
                 // SAFETY: notifier/port/connect 均为注册得到的有效句柄
@@ -127,21 +141,17 @@ impl PowerMonitor {
                     IONotificationPortDestroy(port);
                     IOServiceClose(connect);
                 }
-                runloop_slot.store(std::ptr::null_mut(), Ordering::Release);
                 // cbs 在此 drop
             });
 
         match thread {
             Ok(h) => Self {
-                runloop,
+                stop,
                 thread: Some(h),
             },
             Err(e) => {
                 tracing::error!(target: "mouseshare::mac", %e, "电源监听线程创建失败");
-                Self {
-                    runloop,
-                    thread: None,
-                }
+                Self { stop, thread: None }
             }
         }
     }
@@ -149,13 +159,32 @@ impl PowerMonitor {
 
 impl Drop for PowerMonitor {
     fn drop(&mut self) {
-        let rl = self.runloop.load(Ordering::Acquire);
-        if !rl.is_null() {
-            // SAFETY: CFRunLoopStop 线程安全
-            unsafe { CFRunLoopStop(rl) };
-        }
+        self.stop.store(true, Ordering::Release);
         if let Some(h) = self.thread.take() {
             let _ = h.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn 启动后立即销毁监听不会等待尚未发布的runloop() {
+        // 无需睡眠或更改系统权限；立即退出会话同样会走此启动/销毁窗口。
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for _ in 0..8 {
+                let monitor = PowerMonitor::start(|| {}, || {});
+                drop(monitor);
+            }
+            let _ = done.send(());
+        });
+        assert!(
+            finished.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "Drop 必须能取消仍在初始化的电源监听线程"
+        );
     }
 }

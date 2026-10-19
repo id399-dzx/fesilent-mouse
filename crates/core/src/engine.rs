@@ -6,7 +6,7 @@ use ms_platform::{Button, InputEvent, Rect};
 use ms_proto::{self as proto, Layout, Msg};
 
 use crate::control::{Action, ControlEvent, ControlMachine, ControlState, Signal};
-use crate::input_map::{ModifierMode, map_modifier};
+use crate::input_map::{ModifierMode, Shortcut, ShortcutTracker, map_modifier};
 use crate::layout::{
     Point, clamp_to_rect, detect_exit, entry_point, inset_from_edge, opposite, push_toward,
 };
@@ -91,6 +91,14 @@ pub struct Engine {
     return_push_dist: f64,
     /// 当前返回边累计的推挤量（达 `return_push_dist` 即交还并清零；离开返回带也清零）。
     return_push_accum: f64,
+    local_locked: bool,
+    shortcuts: Option<(Shortcut, Shortcut)>,
+    switch_tracker: ShortcutTracker,
+    lock_tracker: ShortcutTracker,
+    /// 双方同时发起控制时，由证书指纹确定唯一胜方，避免双端同时 grab。
+    wins_collision: bool,
+    display_offset: f64,
+    consumed_shortcut_keys: [bool; 256],
 }
 
 impl Engine {
@@ -118,6 +126,13 @@ impl Engine {
             edge_push_accum: 0.0,
             return_push_dist: 0.0,
             return_push_accum: 0.0,
+            local_locked: false,
+            shortcuts: None,
+            switch_tracker: ShortcutTracker::default(),
+            lock_tracker: ShortcutTracker::default(),
+            wins_collision: false,
+            display_offset: 0.0,
+            consumed_shortcut_keys: [false; 256],
         }
     }
 
@@ -148,6 +163,77 @@ impl Engine {
     /// 实时更新屏幕布局（对端方位），用于设置改动即时生效（不必重启互控）。
     pub fn set_layout(&mut self, layout: Layout) {
         self.layout = layout;
+        self.edge_push_accum = 0.0;
+        self.return_push_accum = 0.0;
+    }
+
+    pub fn set_shortcuts(&mut self, bindings: Option<(Shortcut, Shortcut)>) {
+        if self.shortcuts != bindings {
+            self.shortcuts = bindings;
+            self.switch_tracker.reset();
+            self.lock_tracker.reset();
+        }
+    }
+
+    pub fn set_collision_priority(&mut self, wins: bool) {
+        self.wins_collision = wins;
+    }
+
+    pub fn set_display_offset(&mut self, offset: f64) {
+        self.display_offset = if offset.is_finite() { offset } else { 0.0 };
+    }
+
+    pub fn local_locked(&self) -> bool {
+        self.local_locked
+    }
+
+    /// 临时锁定立即退出控制关系，同时通知对端释放。解锁后需重新推挤。
+    pub fn set_local_lock(&mut self, locked: bool) -> EngineOut {
+        self.local_locked = locked;
+        self.edge_push_accum = 0.0;
+        self.return_push_accum = 0.0;
+        if locked {
+            self.return_local()
+        } else {
+            EngineOut::default()
+        }
+    }
+
+    fn return_local(&mut self) -> EngineOut {
+        let mut out = EngineOut::default();
+        let acts = match self.state() {
+            ControlState::Remote => self.machine.on_event(ControlEvent::ExitRemote),
+            ControlState::Controlled => {
+                let acts = self.machine.on_event(ControlEvent::PeerLeave);
+                out.to_peer.push(signal_to_msg(Signal::ReleaseAll));
+                out.to_peer.push(signal_to_msg(Signal::LeaveScreen));
+                acts
+            }
+            ControlState::Local => Vec::new(),
+        };
+        self.apply_actions(acts, &mut out, None);
+        self.shadow = None;
+        out
+    }
+
+    /// 快捷键与边缘使用同一控制权事务。
+    pub fn toggle_control(&mut self) -> EngineOut {
+        if self.state() != ControlState::Local {
+            return self.return_local();
+        }
+        let mut out = EngineOut::default();
+        if self.local_locked || !self.can_initiate {
+            return out;
+        }
+        self.exit_pos = clamp_to_rect(&self.own_rect, self.local_pos);
+        let acts = self.machine.on_event(ControlEvent::EnterRemote {
+            edge: opposite(self.layout.peer_position),
+            ratio: 0.5,
+        });
+        self.apply_actions(acts, &mut out, None);
+        // 本机已按下快捷键前缀；远端开始新一轮输入前先清理，防止残留修饰键。
+        out.inject.push(Inject::ReleaseAll);
+        out
     }
 
     /// 设置边缘"刻意触发"推挤阈值（像素，T-511）。`<= 0` 表示贴边即穿越（关闭推挤）。
@@ -202,6 +288,43 @@ impl Engine {
     /// 干扰正常 Esc 使用已按用户要求移除（T-614）。失控兜底仍有：断连安全回退
     /// （FR-605）与托盘「暂停互控」。
     pub fn feed_local(&mut self, ev: InputEvent) -> EngineOut {
+        if let (InputEvent::Key { key, down }, Some((switch, lock))) = (ev, self.shortcuts) {
+            let switching = self.switch_tracker.update(key.0, down, switch);
+            let locking = self.lock_tracker.update(key.0, down, lock);
+            if switching || locking {
+                if let Some(consumed) = self.consumed_shortcut_keys.get_mut(key.0 as usize) {
+                    *consumed = true;
+                }
+                let was_local = self.state() == ControlState::Local;
+                let mut out = if locking {
+                    self.set_local_lock(!self.local_locked)
+                } else {
+                    self.toggle_control()
+                };
+                if was_local && self.state() == ControlState::Remote {
+                    // 快捷键前缀已被本机OS收到，进入grab后其物理up会被拦截；显式释放
+                    // 实际按下的左右修饰键及末键，不能仅依赖“曾注入”按键tracker。
+                    out.inject.extend(
+                        self.switch_tracker
+                            .pressed_modifiers()
+                            .map(|hid| Inject::Key { hid, down: false }),
+                    );
+                    out.inject.push(Inject::Key {
+                        hid: key.0,
+                        down: false,
+                    });
+                }
+                return out;
+            }
+            if let Some(consumed) = self.consumed_shortcut_keys.get_mut(key.0 as usize)
+                && *consumed
+            {
+                if !down {
+                    *consumed = false;
+                }
+                return EngineOut::default();
+            }
+        }
         let mut out = EngineOut::default();
         match self.machine.state() {
             ControlState::Local => self.local_input(ev, &mut out),
@@ -217,10 +340,10 @@ impl Engine {
             // LOCAL 用绝对光标位置判边缘（比累积位移可靠）
             self.local_pos = clamp_to_rect(&self.own_rect, Point { x: ax, y: ay });
             // 从属端：不主动发起控制对端（单向主从）
-            if !self.can_initiate {
+            if !self.can_initiate || self.local_locked {
                 return;
             }
-            let Some(info) = detect_exit(
+            let Some(mut info) = detect_exit(
                 &self.own_rect,
                 self.local_pos,
                 self.layout,
@@ -231,6 +354,19 @@ impl Engine {
                 self.edge_push_accum = 0.0;
                 return;
             };
+            if self.display_offset != 0.0 {
+                let Some(ratio) = crate::layout::offset_entry_ratio(
+                    &self.own_rect,
+                    &self.peer_rect,
+                    self.local_pos,
+                    self.layout.peer_position,
+                    self.display_offset,
+                ) else {
+                    self.edge_push_accum = 0.0;
+                    return;
+                };
+                info.ratio = ratio;
+            }
             // 边缘"刻意触发"（T-511，FR-205/207）：贴边后须继续朝该边累计推够
             // `edge_push_dist` 像素才穿越，避免一碰边就穿越（够不着菜单栏/任务栏）。
             // 阈值 <= 0 时退化为「贴边即穿越」（旧行为）。
@@ -360,6 +496,19 @@ impl Engine {
         let mut out = EngineOut::default();
         match msg {
             Msg::EnterScreen(e) => {
+                if self.local_locked {
+                    out.to_peer.push(signal_to_msg(Signal::ReleaseAll));
+                    out.to_peer.push(signal_to_msg(Signal::LeaveScreen));
+                    return out;
+                }
+                if self.state() == ControlState::Remote {
+                    if self.wins_collision {
+                        return out;
+                    }
+                    let acts = self.machine.on_event(ControlEvent::Disconnect);
+                    self.apply_actions(acts, &mut out, None);
+                    self.shadow = None;
+                }
                 tracing::info!(
                     target: "mouseshare::engine",
                     edge = ?e.entry_edge,
@@ -435,6 +584,11 @@ impl Engine {
         self.apply_actions(acts, &mut out, None);
         self.shadow = None;
         self.scroll_scaler.reset();
+        self.switch_tracker.reset();
+        self.lock_tracker.reset();
+        self.edge_push_accum = 0.0;
+        self.return_push_accum = 0.0;
+        self.consumed_shortcut_keys.fill(false);
         out
     }
 }

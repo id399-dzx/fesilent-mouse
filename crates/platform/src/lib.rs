@@ -5,6 +5,7 @@
 //! 左上原点、y 向下、f64 物理像素；键码统一 USB HID Usage ID（page 0x07）。
 
 pub mod stub;
+pub mod synthetic;
 
 use std::fmt;
 use std::path::PathBuf;
@@ -160,6 +161,10 @@ pub type Result<T> = std::result::Result<T, PlatformError>;
 
 /// 本机键鼠捕获。
 pub trait InputCapture: Send {
+    /// 周期检查捕获线程是否仍可用；故障须由应用解除 grab 并释放输入。
+    fn check_health(&self) -> Result<()> {
+        Ok(())
+    }
     /// 开始捕获；grab=true 时拦截事件不让本机响应（控制对端期间）。
     fn start(&mut self, sink: EventSink, grab: bool) -> Result<()>;
     /// 动态切换 grab（进入/退出 REMOTE 的控制权事务，DEVELOPMENT §2.3）。

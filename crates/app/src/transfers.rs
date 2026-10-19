@@ -76,6 +76,8 @@ pub struct HistoryItem {
     pub outcome: Phase,
     /// 起传到结束的耗时（秒）。
     pub secs: u64,
+    /// 用户可理解的失败原因，仅保存在本次运行的内存中。
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -110,6 +112,7 @@ struct Entry {
     cancel: Arc<AtomicBool>,
     decision: Arc<AtomicU8>,
     rate: RateState,
+    error: Option<String>,
 }
 
 /// 一条传输的只读视图（供 UI 渲染）。
@@ -125,6 +128,7 @@ pub struct View {
     pub rate_bps: f64,
     /// 剩余时间估算（秒）；未知为 None（T-809）。
     pub eta_secs: Option<u64>,
+    pub error: Option<String>,
 }
 
 /// 收发任务持有的控制句柄。
@@ -144,6 +148,11 @@ impl Handle {
     /// 大文件确认后转 Active 时重置速率计时（确认等待不计入耗时/速率）。
     pub fn set_phase(&self, p: Phase) {
         center().set_phase(self.id, p);
+    }
+
+    /// 与失败终态一起发布原因，界面和历史不会出现只有「失败」的无出口状态。
+    pub fn fail(&self, message: impl Into<String>) {
+        center().fail(self.id, message.into());
     }
 
     /// 用户是否已请求取消。
@@ -227,6 +236,20 @@ impl TransferCenter {
         }
     }
 
+    fn fail(&self, id: u64, message: String) {
+        let history = self.with(|list| {
+            let entry = list.iter_mut().find(|entry| entry.id == id)?;
+            if !matches!(entry.phase, Phase::Active | Phase::Confirm) {
+                return None;
+            }
+            entry.error = Some(message);
+            transition(entry, Phase::Failed, Instant::now())
+        });
+        if let Some(history) = history {
+            self.push_history(history);
+        }
+    }
+
     /// 会话结束时收尾所有未完成项；任务被运行时取消后，UI 仍能看到正确终态。
     /// 与正常任务完成共用相位迁移，迟到的进度或结果不能复活条目、重复写历史。
     pub fn cancel_active(&self) {
@@ -272,6 +295,7 @@ impl TransferCenter {
                 cancel: Arc::clone(&cancel),
                 decision: Arc::clone(&decision),
                 rate: RateState::new(Instant::now()),
+                error: None,
             });
         });
         if needs_confirm {
@@ -303,6 +327,7 @@ impl TransferCenter {
                         } else {
                             None
                         },
+                        error: e.error.clone(),
                     }
                 })
                 .collect()
@@ -391,6 +416,7 @@ fn transition(entry: &mut Entry, phase: Phase, now: Instant) -> Option<HistoryIt
             },
             outcome: phase,
             secs: now.duration_since(entry.rate.started).as_secs(),
+            error: entry.error.clone(),
         }),
         Phase::Confirm => None,
     }
@@ -418,6 +444,31 @@ fn prune_finished(list: &mut Vec<Entry>) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn 失败原因同时进入界面和历史且迟到失败不覆盖终态() {
+        let center = TransferCenter::new();
+        let failed = center.begin("network.bin".into(), 100, Dir::Send);
+        center.fail(failed.id, "对端连接已中断".into());
+        let view = center.snapshot();
+        assert_eq!(view[0].phase, Phase::Failed);
+        assert_eq!(view[0].error.as_deref(), Some("对端连接已中断"));
+        assert_eq!(center.history()[0].error, view[0].error);
+        center.fail(failed.id, "迟到的第二次错误".into());
+        assert_eq!(center.history().len(), 1);
+        assert_eq!(
+            center.snapshot()[0].error.as_deref(),
+            Some("对端连接已中断")
+        );
+
+        let cancelled = center.begin("cancelled.bin".into(), 100, Dir::Recv);
+        center.set_phase(cancelled.id, Phase::Cancelled);
+        center.fail(cancelled.id, "取消后才到达的网络错误".into());
+        let view = center.snapshot();
+        assert_eq!(view[1].phase, Phase::Cancelled);
+        assert!(view[1].error.is_none());
+        assert!(center.history()[0].error.is_none());
+    }
+
     // 每个测试使用独立中心，不与并行测试或 daemon 测试共享进程级 CENTER。
     #[test]
     fn 传输中心_确认进度取消() {
@@ -431,16 +482,10 @@ mod tests {
         let recv_big = c.begin("r.bin".into(), LARGE_FILE_THRESHOLD + 1, Dir::Recv);
         assert!(!c.take_show_request(), "小文件与接收不应请求弹窗");
 
-        let phase = |id| {
-            c.snapshot()
-                .iter()
-                .find(|v| v.id == id)
-                .map(|v| v.phase)
-                .unwrap()
-        };
-        assert_eq!(phase(big.id), Phase::Confirm, "大文件发送需确认");
-        assert_eq!(phase(small.id), Phase::Active, "小文件直接传");
-        assert_eq!(phase(recv_big.id), Phase::Active, "接收端不弹确认");
+        let phase = |id| c.snapshot().iter().find(|v| v.id == id).map(|v| v.phase);
+        assert_eq!(phase(big.id), Some(Phase::Confirm), "大文件发送需确认");
+        assert_eq!(phase(small.id), Some(Phase::Active), "小文件直接传");
+        assert_eq!(phase(recv_big.id), Some(Phase::Active), "接收端不弹确认");
 
         // 进度更新可读
         c.update(big.id, 500);
@@ -448,9 +493,8 @@ mod tests {
             c.snapshot()
                 .iter()
                 .find(|v| v.id == big.id)
-                .unwrap()
-                .transferred,
-            500
+                .map(|v| v.transferred),
+            Some(500)
         );
 
         // 确认 → decision=APPROVE
@@ -497,8 +541,12 @@ mod tests {
         c.set_phase(b.id, Phase::Cancelled); // 重复置同一终态不重复落账
 
         let h = c.history();
-        let ia = h.iter().position(|x| x.name == "hist-a.bin").unwrap();
-        let ib = h.iter().position(|x| x.name == "hist-b.bin").unwrap();
+        let Some(ia) = h.iter().position(|x| x.name == "hist-a.bin") else {
+            panic!("已完成的 hist-a.bin 必须进入历史");
+        };
+        let Some(ib) = h.iter().position(|x| x.name == "hist-b.bin") else {
+            panic!("已取消的 hist-b.bin 必须进入历史");
+        };
         assert!(ib < ia, "新的在前");
         assert_eq!(h[ia].outcome, Phase::Done);
         assert_eq!(h[ia].bytes, 2048, "完成按文件总大小");
@@ -538,16 +586,16 @@ mod tests {
         assert_eq!(pending.decision.load(Ordering::Acquire), DECISION_REJECT);
         let views = c.snapshot();
         assert_eq!(
-            views.iter().find(|v| v.id == pending.id).unwrap().phase,
-            Phase::Cancelled
+            views.iter().find(|v| v.id == pending.id).map(|v| v.phase),
+            Some(Phase::Cancelled)
         );
         assert_eq!(
-            views.iter().find(|v| v.id == active.id).unwrap().phase,
-            Phase::Cancelled
+            views.iter().find(|v| v.id == active.id).map(|v| v.phase),
+            Some(Phase::Cancelled)
         );
         assert_eq!(
-            views.iter().find(|v| v.id == done.id).unwrap().phase,
-            Phase::Done
+            views.iter().find(|v| v.id == done.id).map(|v| v.phase),
+            Some(Phase::Done)
         );
         let history = c.history();
         assert_eq!(history.len(), 3);
@@ -555,17 +603,15 @@ mod tests {
             history
                 .iter()
                 .find(|item| item.name == "active.bin")
-                .unwrap()
-                .bytes,
-            1234
+                .map(|item| item.bytes),
+            Some(1234)
         );
         assert_eq!(
             history
                 .iter()
                 .find(|item| item.name == "done.bin")
-                .unwrap()
-                .outcome,
-            Phase::Done
+                .map(|item| item.outcome),
+            Some(Phase::Done)
         );
 
         // 模拟正在结束的后台任务返回迟到成功/失败，以及陈旧的确认按钮事件。
@@ -583,9 +629,8 @@ mod tests {
             c.snapshot()
                 .iter()
                 .find(|v| v.id == active.id)
-                .unwrap()
-                .transferred,
-            1234
+                .map(|v| v.transferred),
+            Some(1234)
         );
     }
 }

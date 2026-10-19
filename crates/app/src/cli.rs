@@ -125,14 +125,21 @@ fn parse_wxh(s: &str) -> Result<(f64, f64), ArgError> {
     let (w, h) = s
         .split_once(['x', 'X'])
         .ok_or_else(|| ArgError(format!("屏幕尺寸需 WxH 格式，得到 {s}")))?;
-    let w = w
+    let w: f64 = w
         .trim()
         .parse()
         .map_err(|_| ArgError(format!("无效宽度: {w}")))?;
-    let h = h
+    let h: f64 = h
         .trim()
         .parse()
         .map_err(|_| ArgError(format!("无效高度: {h}")))?;
+    if !w.is_finite()
+        || !h.is_finite()
+        || !(2.0..=100_000.0).contains(&w)
+        || !(2.0..=100_000.0).contains(&h)
+    {
+        return Err(ArgError("屏幕宽高必须是 2–100000 范围内的有限数值".into()));
+    }
     Ok((w, h))
 }
 
@@ -177,6 +184,41 @@ mod tests {
     #[test]
     fn 录制回放互斥() {
         assert!(p(&["--record", "a", "--replay", "b"]).is_err());
+    }
+
+    #[test]
+    fn 屏幕参数拒绝非法边界避免回退尺寸进入引擎() {
+        for flag in ["--screen", "--peer-screen"] {
+            for size in [
+                "0x900",
+                "1920x0",
+                "-1x900",
+                "1x900",
+                "NaNx900",
+                "1920xinf",
+                "100001x900",
+                "1920x100001",
+            ] {
+                assert!(p(&[flag, size]).is_err(), "{flag} {size} 必须拒绝");
+            }
+            let parsed = p(&[flag, "2560X1440"]).unwrap();
+            assert_eq!(
+                if flag == "--screen" {
+                    parsed.screen
+                } else {
+                    parsed.peer_screen
+                },
+                (2560.0, 1440.0)
+            );
+        }
+        assert_eq!(
+            p(&["--screen", "2x100000"]).unwrap().screen,
+            (2.0, 100000.0)
+        );
+        assert_eq!(
+            p(&["--peer-screen", "2560x1440"]).unwrap().peer_screen,
+            (2560.0, 1440.0)
+        );
     }
 
     #[test]

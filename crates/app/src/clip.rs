@@ -165,6 +165,20 @@ const FILE_BATCH_WINDOW: Duration = Duration::from_secs(2);
 struct FileBatch {
     paths: Vec<PathBuf>,
     last_offer: Option<Instant>,
+    /// 新复制操作会推进代数，旧流仍可落地但不能再夺回剪贴板。
+    generation: u64,
+    /// 本批开始/上次写回时的本机序号；本机用户复制新内容后旧批不再写回。
+    clipboard_count: Option<u64>,
+}
+
+impl FileBatch {
+    fn invalidate(&mut self) -> u64 {
+        self.generation = self.generation.wrapping_add(1);
+        self.paths.clear();
+        self.last_offer = None;
+        self.clipboard_count = None;
+        self.generation
+    }
 }
 
 fn lock_batch(b: &Mutex<FileBatch>) -> std::sync::MutexGuard<'_, FileBatch> {
@@ -187,58 +201,99 @@ pub fn spawn_receiver<P: Platform>(
     state: SharedClipState,
     running: Arc<AtomicBool>,
 ) -> Result<tokio::task::JoinHandle<()>, String> {
+    spawn_receiver_with_dir(conn, platform, state, running, None)
+}
+
+/// 测试显式注入文件接收目录，生产仍由 xfer::receive 使用平台默认目录。
+fn spawn_receiver_with_dir<P: Platform>(
+    conn: Conn,
+    platform: &P,
+    state: SharedClipState,
+    running: Arc<AtomicBool>,
+    receive_dir: Option<PathBuf>,
+) -> Result<tokio::task::JoinHandle<()>, String> {
     let clip: ClipHandle = Arc::new(Mutex::new(platform.clipboard().map_err(|e| e.to_string())?));
     let batch = Arc::new(Mutex::new(FileBatch {
         paths: Vec::new(),
         last_offer: None,
+        generation: 0,
+        clipboard_count: None,
     }));
     Ok(tokio::spawn(async move {
+        let mut tasks = tokio::task::JoinSet::new();
         while running.load(Ordering::Acquire) {
-            let mut stream = match conn.accept_msg_stream().await {
-                Ok(s) => s,
-                Err(_) => break, // 连接关闭
+            let mut stream = tokio::select! {
+                _ = wait_until_stopped(&running) => break,
+                Some(_) = tasks.join_next(), if !tasks.is_empty() => continue,
+                result = conn.accept_msg_stream() => match result {
+                    Ok(stream) => stream,
+                    Err(_) => break, // 连接关闭
+                },
             };
             let clip = clip.clone();
             let state = state.clone();
             let batch = batch.clone();
-            tokio::spawn(async move {
+            let receive_dir = receive_dir.clone();
+            tasks.spawn(async move {
                 match stream.recv().await {
                     Ok(Some(Msg::ClipboardData(first))) => {
+                        // 到达时立刻使旧文件批次失效，不能等文本接收完才清空路径。
+                        let generation = lock_batch(&batch).invalidate();
                         // 诊断（排查「文件传输后文本不同步」）：收到剪贴板流首条
                         tracing::info!(
                             target: "mouseshare::clip",
                             mime = %first.mime,
                             "接收到独立流：剪贴板内容（开始重组写入）"
                         );
-                        receive_clipboard(&mut stream, first, &clip, &state).await;
-                        // 剪贴板已被非文件内容占据：清空文件批次，防止之后落地的
-                        // 文件把已过期的旧批路径一并写回（T-807）。
-                        lock_batch(&batch).paths.clear();
+                        receive_clipboard(
+                            &mut stream,
+                            first,
+                            &clip,
+                            &state,
+                            Some((&batch, generation)),
+                        )
+                        .await;
                     }
                     Ok(Some(Msg::FileOffer(offer))) => {
                         // 归批按 offer 到达时刻判定（须在接收前，落地耗时不影响归批）：
                         // 同一次复制的多个文件由发送端同时开流，offer 几乎同时到达；
                         // 距上一条超过窗口即视为新的复制操作、重开一批（T-807）。
-                        {
+                        let generation = {
                             let mut b = lock_batch(&batch);
                             if b.last_offer.is_none_or(|t| t.elapsed() > FILE_BATCH_WINDOW) {
-                                b.paths.clear();
+                                b.invalidate();
+                                b.clipboard_count = lock_clip(&clip).change_count().ok();
                             }
                             b.last_offer = Some(Instant::now());
-                        }
-                        if let Some(path) = crate::xfer::receive(&mut stream, offer).await {
+                            b.generation
+                        };
+                        let path = match receive_dir.as_deref() {
+                            Some(dir) => crate::xfer::receive_in_dir(&mut stream, offer, dir).await,
+                            None => crate::xfer::receive(&mut stream, offer).await,
+                        };
+                        if let Some(path) = path {
                             // 累积本批全部已落地路径**整批**写回剪贴板，使一次复制的
                             // 多个文件都可粘贴——修复前各流只写自己的路径，互相覆盖
                             // 只剩最后完成的一个（T-807/T-504 已知限制）。
-                            let all = {
-                                let mut b = lock_batch(&batch);
-                                b.paths.push(path);
-                                b.paths.clone()
-                            };
+                            // 所有接收写回均按 batch→clip 顺序加锁；检查与写入同一临界区，
+                            // 防止旧任务在新文本写入后才拿到剪贴板锁并覆盖它。
+                            let mut b = lock_batch(&batch);
+                            if generation != b.generation {
+                                return;
+                            }
                             let mut c = lock_clip(&clip);
-                            if c.write_files(&all).is_ok()
+                            if let (Some(expected), Ok(current)) =
+                                (b.clipboard_count, c.change_count())
+                                && expected != current
+                            {
+                                b.invalidate();
+                                return; // 用户已在本机复制更新内容；文件保留在接收目录。
+                            }
+                            b.paths.push(path);
+                            if c.write_files(&b.paths).is_ok()
                                 && let Ok(cc) = c.change_count()
                             {
+                                b.clipboard_count = Some(cc);
                                 // 写入抬升本地序号，标记已同步避免把刚收到的文件回弹给对端。
                                 lock(&state).note_synced(cc);
                             }
@@ -249,7 +304,16 @@ pub fn spawn_receiver<P: Platform>(
                 }
             });
         }
+        // 不让旧会话文件/剪贴板任务游离到下一次连接；任务 Drop 同时清理临时文件。
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
     }))
+}
+
+async fn wait_until_stopped(running: &AtomicBool) {
+    while running.load(Ordering::Acquire) {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// 在已接受的流上重组一份完整剪贴板内容并写入本机系统剪贴板。
@@ -258,6 +322,7 @@ async fn receive_clipboard(
     first: ClipboardData,
     clip: &ClipHandle,
     state: &SharedClipState,
+    revision: Option<(&Mutex<FileBatch>, u64)>,
 ) {
     let mut re = Reassembler::new();
     let mut done = match re.push(first) {
@@ -279,6 +344,22 @@ async fn receive_clipboard(
         }
     }
     let Some(content) = done else { return };
+    // 重组完成后消费发送方的 FIN；提前 Drop 会发 STOP_SENDING，让正常发送误报失败。
+    // 完整内容后还有帧时丢弃该流，不能把未验证结束的内容写进本机剪贴板。
+    if !matches!(stream.recv().await, Ok(None)) {
+        return;
+    }
+    // 若另一份文本/文件已先到达，丢弃这个迟到流的剪贴板写入。
+    let _batch_guard = match revision {
+        Some((batch, generation)) => {
+            let batch = lock_batch(batch);
+            if batch.generation != generation {
+                return;
+            }
+            Some(batch)
+        }
+        None => None,
+    };
     let mut c = lock_clip(clip);
     if let Err(e) = c.write(&content) {
         tracing::warn!(target: "mouseshare::clip", %e, "写本机剪贴板失败");
@@ -298,6 +379,16 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
     use ms_platform::ClipboardContent;
+
+    fn test_directory(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/clip-tests")
+            .join(format!(
+                "{name}-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            ))
+    }
 
     /// 内存假剪贴板：写入即记录并抬升 changeCount，供端到端回环测试。
     #[derive(Default)]
@@ -356,7 +447,7 @@ mod tests {
             };
             let mock: ClipHandle = Arc::new(Mutex::new(Box::new(MockClip::default())));
             let state = shared_state(true);
-            receive_clipboard(&mut stream, first, &mock, &state).await;
+            receive_clipboard(&mut stream, first, &mock, &state, None).await;
             sender.await.unwrap();
 
             let mut c = lock_clip(&mock);
@@ -457,13 +548,10 @@ mod tests {
     fn 回环_文件传输后文本仍能同步() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            // 接收目录隔离到临时 HOME，避免污染 ~/Downloads
-            let tmp_home =
-                std::env::temp_dir().join(format!("ms-loop-home-{}", std::process::id()));
-            std::fs::create_dir_all(&tmp_home).unwrap();
-            unsafe {
-                std::env::set_var("HOME", &tmp_home);
-            }
+            // 每个测试显式使用项目内接收目录，避免修改其它并发测试的进程环境。
+            let test_dir = test_directory("file-then-text");
+            std::fs::create_dir_all(&test_dir).unwrap();
+            let receive_dir = test_dir.join("received");
 
             // 两端连接：sender=a（client），receiver=b（server）；endpoint 全程保活
             use std::net::{Ipv4Addr, SocketAddr};
@@ -486,7 +574,14 @@ mod tests {
             let store_b = Arc::new(Mutex::new(ClipStore::default()));
             let platform_b = MockPlatform(SharedClip(store_b.clone()));
             let running = Arc::new(AtomicBool::new(true));
-            spawn_receiver(b, &platform_b, shared_state(true), running.clone()).unwrap();
+            spawn_receiver_with_dir(
+                b,
+                &platform_b,
+                shared_state(true),
+                running.clone(),
+                Some(receive_dir.clone()),
+            )
+            .unwrap();
 
             // 发送端剪贴板 + 状态
             let store_a = Arc::new(Mutex::new(ClipStore::default()));
@@ -522,7 +617,7 @@ mod tests {
             );
 
             // ② 复制文件 → 接收端应落地文件
-            let f = tmp_home.join("payload.bin");
+            let f = test_dir.join("payload.bin");
             // 64 KiB（多数据报、多分块）覆盖「文件传输后文本仍能同步」回归路径
             tokio::fs::write(&f, vec![0xABu8; 64 * 1024]).await.unwrap();
             {
@@ -542,6 +637,15 @@ mod tests {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
             assert!(landed, "②文件应落地到接收端剪贴板（30s 内）");
+            assert!(
+                store_b
+                    .lock()
+                    .unwrap()
+                    .files
+                    .iter()
+                    .all(|path| path.starts_with(&receive_dir)),
+                "接收文件必须落在本测试显式指定的目录中"
+            );
 
             // ③ 复制文本 → 接收端应拿到新文本（用户报此处失效）
             {
@@ -590,7 +694,14 @@ mod tests {
             let store_b = Arc::new(Mutex::new(ClipStore::default()));
             let platform_b = MockPlatform(SharedClip(store_b.clone()));
             let running = Arc::new(AtomicBool::new(true));
-            spawn_receiver(b, &platform_b, shared_state(true), running.clone()).unwrap();
+            spawn_receiver_with_dir(
+                b,
+                &platform_b,
+                shared_state(true),
+                running.clone(),
+                Some(test_directory("stuck-file").join("received")),
+            )
+            .unwrap();
 
             // ① 模拟"卡住"的文件传输：开一条流、发 FileOffer，但**不发 FileChunk/FileDone**
             // （模拟大文件/弱网下迟迟传不完，接收端会在 recv_into 里一直 await 等下一条消息）。
@@ -643,6 +754,136 @@ mod tests {
         });
     }
 
+    /// 旧文件还在接收时用户已经复制了新内容，旧任务完成不能再抢回剪贴板。
+    #[tokio::test]
+    async fn 回环_迟到文件不覆盖后续文本或本机新复制() {
+        for remote_text in [true, false] {
+            let (a, b) = connect_pair().await;
+            let test_dir = test_directory("late-file");
+            let receive_dir = test_dir.join("received");
+            let store = Arc::new(Mutex::new(ClipStore::default()));
+            let platform = MockPlatform(SharedClip(store.clone()));
+            let running = Arc::new(AtomicBool::new(true));
+            let receiver = spawn_receiver_with_dir(
+                b,
+                &platform,
+                shared_state(true),
+                running.clone(),
+                Some(receive_dir.clone()),
+            )
+            .unwrap();
+            let id = uuid::Uuid::new_v4();
+            let mut file = a.open_msg_stream().await.unwrap();
+            file.send(&Msg::FileOffer(ms_proto::FileOffer {
+                id,
+                name: "late.bin".into(),
+                size: 1,
+            }))
+            .await
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !receive_dir.exists() || std::fs::read_dir(&receive_dir).unwrap().count() == 0
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+
+            let text = ClipboardContent::Text("后来复制的内容必须保留".into());
+            if remote_text {
+                send_chunks(&a, clip_sync::encode(&text).unwrap()).await;
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while store.lock().unwrap().content != Some(text.clone()) {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+            } else {
+                SharedClip(store.clone()).write(&text).unwrap();
+            }
+            file.send(&Msg::FileChunk(ms_proto::FileChunk {
+                id,
+                offset: 0,
+                data: vec![9],
+            }))
+            .await
+            .unwrap();
+            file.send(&Msg::FileDone(ms_proto::FileDone { id }))
+                .await
+                .unwrap();
+            file.finish().await.unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !receive_dir.join("late.bin").exists() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let actual = store.lock().unwrap().content.clone();
+            running.store(false, Ordering::Release);
+            receiver.abort();
+            let _ = receiver.await;
+            let _ = std::fs::remove_dir_all(&test_dir);
+            assert_eq!(
+                actual,
+                Some(text),
+                "旧文件已落地，但不能覆盖更新的剪贴板（remote={remote_text}）"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn 回环_接收器停止或连接关闭会清理全部文件子任务() {
+        for close_connection in [true, false] {
+            let (a, b) = connect_pair().await;
+            let test_dir = test_directory("receiver-stop");
+            let store = Arc::new(Mutex::new(ClipStore::default()));
+            let platform = MockPlatform(SharedClip(store));
+            let running = Arc::new(AtomicBool::new(true));
+            let receiver = spawn_receiver_with_dir(
+                b.clone(),
+                &platform,
+                shared_state(true),
+                running.clone(),
+                Some(test_dir.clone()),
+            )
+            .unwrap();
+            let mut file = a.open_msg_stream().await.unwrap();
+            file.send(&Msg::FileOffer(ms_proto::FileOffer {
+                id: uuid::Uuid::new_v4(),
+                name: "unfinished.bin".into(),
+                size: 100,
+            }))
+            .await
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !test_dir.exists() || std::fs::read_dir(&test_dir).unwrap().count() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            if close_connection {
+                b.close();
+            } else {
+                running.store(false, Ordering::Release);
+            }
+            tokio::time::timeout(Duration::from_secs(2), receiver)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                std::fs::read_dir(&test_dir).unwrap().count(),
+                0,
+                "所有子任务都应退出并清理暂存文件"
+            );
+            let _ = std::fs::remove_dir_all(&test_dir);
+        }
+    }
+
     /// 复现（T-807）：一次复制多个文件穿越后，接收端应把**全部**文件路径写回剪贴板。
     /// 修复前每条文件流的任务各自 `write_files(&[自己])`，互相覆盖，最终剪贴板只剩
     /// 最后完成的那个文件（T-504 已知限制「多文件一次 Cmd+V 仅写回最后一个」）。
@@ -650,12 +891,9 @@ mod tests {
     fn 回环_多文件粘贴应写回全部路径() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let tmp_home =
-                std::env::temp_dir().join(format!("ms-multi-home-{}", std::process::id()));
-            std::fs::create_dir_all(&tmp_home).unwrap();
-            unsafe {
-                std::env::set_var("HOME", &tmp_home);
-            }
+            let test_dir = test_directory("multi-file");
+            std::fs::create_dir_all(&test_dir).unwrap();
+            let receive_dir = test_dir.join("received");
 
             use std::net::{Ipv4Addr, SocketAddr};
             let loopback: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
@@ -676,13 +914,20 @@ mod tests {
             let store_b = Arc::new(Mutex::new(ClipStore::default()));
             let platform_b = MockPlatform(SharedClip(store_b.clone()));
             let running = Arc::new(AtomicBool::new(true));
-            spawn_receiver(b, &platform_b, shared_state(true), running.clone()).unwrap();
+            spawn_receiver_with_dir(
+                b,
+                &platform_b,
+                shared_state(true),
+                running.clone(),
+                Some(receive_dir.clone()),
+            )
+            .unwrap();
 
             // 发送端一次复制 3 个文件
             let names = ["multi-a.bin", "multi-b.bin", "multi-c.bin"];
             let mut paths = Vec::new();
             for (i, n) in names.iter().enumerate() {
-                let p = tmp_home.join(n);
+                let p = test_dir.join(n);
                 tokio::fs::write(&p, vec![i as u8 + 1; 16 * 1024])
                     .await
                     .unwrap();
@@ -726,6 +971,15 @@ mod tests {
                 got,
                 names.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
                 "一次复制的多个文件应全部写回接收端剪贴板（T-807 复现点）"
+            );
+            assert!(
+                store_b
+                    .lock()
+                    .unwrap()
+                    .files
+                    .iter()
+                    .all(|path| path.starts_with(&receive_dir)),
+                "所有接收文件必须落在本测试显式指定的目录中"
             );
 
             running.store(false, Ordering::Release);

@@ -9,7 +9,7 @@
 //! 启动注入系统 CJK 字体（mac PingFang / Windows 雅黑），否则中文显示为豆腐块。
 
 use std::num::NonZeroU32;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,31 +32,47 @@ use crate::cliphist;
 use crate::config::{self, Config};
 use crate::daemon;
 use crate::diag;
-use crate::status::ConnStatus;
+use crate::status::{ConnStatus, ConnectionPhase};
 use crate::transfers::{self, Dir, Phase};
 
 mod views;
 
-/// 方位九宫格的单元尺寸（T-606）。
-const SIDE_CELL: [f32; 2] = [64.0, 36.0];
-
-/// 九宫格空位（占位对齐用）。
-fn blank_cell(ui: &mut egui::Ui) {
-    ui.add_sized(SIDE_CELL, egui::Label::new(""));
+/// 独立 UI 预览不读取用户设置、不发起连接，也不申请输入权限。
+fn preview_platform(value: Option<&str>) -> Option<bool> {
+    match value {
+        Some("windows") => Some(false),
+        Some("mac") => Some(true),
+        Some("1") => Some(cfg!(target_os = "macos")),
+        _ => None,
+    }
 }
 
-/// 九宫格方位单元：选中态按钮，点击把配置键写回 `side`。
-fn side_cell(ui: &mut egui::Ui, side: &mut String, dirty: &mut bool, key: &str, label: &str) {
-    if ui
-        .add_sized(
-            SIDE_CELL,
-            egui::Button::selectable(side.as_str() == key, label),
-        )
-        .clicked()
-    {
-        *side = key.to_string();
-        *dirty = true;
+pub(crate) fn ui_preview_enabled() -> bool {
+    preview_platform(std::env::var("FESILENT_UI_PREVIEW").ok().as_deref()).is_some()
+}
+
+/// 用系统文件管理器打开已存在的本地目录，不把路径交给 shell 解释。
+fn open_path(path: &Path) -> Result<(), String> {
+    if ui_preview_enabled() {
+        return Err("预览模式：不会打开实际文件目录。".into());
     }
+    if !path.exists() {
+        return Err("接收目录尚未创建，收到第一个文件后即可打开。".into());
+    }
+    #[cfg(target_os = "macos")]
+    let mut command = std::process::Command::new("open");
+    #[cfg(target_os = "windows")]
+    let mut command = std::process::Command::new("explorer.exe");
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let mut command = std::process::Command::new("xdg-open");
+    command
+        .arg(path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|_| "无法打开文件夹，请在系统文件管理器中查看下载目录。".into())
 }
 
 // ===================== GL 窗口（glutin，参照 egui_glow pure_glow 示例） =====================
@@ -78,7 +94,7 @@ impl GlutinWindowContext {
     unsafe fn new(event_loop: &ActiveEventLoop) -> Self {
         let mut win_attrs = Window::default_attributes()
             .with_resizable(true)
-            .with_inner_size(winit::dpi::LogicalSize::new(920.0, 740.0))
+            .with_inner_size(winit::dpi::LogicalSize::new(1040.0, 760.0))
             .with_min_inner_size(winit::dpi::LogicalSize::new(680.0, 560.0))
             .with_title("Fesilent Mouse")
             .with_visible(false);
@@ -184,16 +200,22 @@ struct DaemonHandle {
     running: Arc<AtomicBool>,
     status: Arc<ConnStatus>,
     thread: Option<JoinHandle<()>>,
+    ui_preview: bool,
+    operation_result: Arc<Mutex<Option<Result<String, String>>>>,
 }
 
 impl DaemonHandle {
     fn new(config: Arc<Mutex<Config>>, log_dir: Option<PathBuf>) -> Self {
+        let status = Arc::new(ConnStatus::new());
+        status.require_pairing_confirmation(true);
         Self {
             config,
             log_dir,
             running: Arc::new(AtomicBool::new(false)),
-            status: Arc::new(ConnStatus::new()),
+            status,
             thread: None,
+            ui_preview: ui_preview_enabled(),
+            operation_result: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -213,6 +235,19 @@ impl DaemonHandle {
         if self.is_running() {
             return;
         }
+        if self.ui_preview {
+            self.running.store(true, Ordering::Release);
+            self.status.set_phase(
+                if preview_platform(std::env::var("FESILENT_UI_PREVIEW").ok().as_deref())
+                    == Some(true)
+                {
+                    ConnectionPhase::Listening
+                } else {
+                    ConnectionPhase::Discovering
+                },
+            );
+            return;
+        }
         let Ok(mut cfg) = self.config.lock().map(|c| c.clone()) else {
             return;
         };
@@ -222,6 +257,14 @@ impl DaemonHandle {
                 self.status.set_error(error);
                 return;
             }
+        }
+        if !cfg.devices.records.is_empty()
+            && cfg.devices.active_target.is_none()
+            && !self.status.adding_device()
+        {
+            self.status
+                .set_error("请在「我的设备」中设置方位并选择连接目标，或点击添加新设备。");
+            return;
         }
         self.status.clear_error();
         let args = cfg.to_args(self.log_dir.clone());
@@ -250,6 +293,52 @@ impl DaemonHandle {
     fn stop(&mut self) {
         self.running.store(false, Ordering::Release);
         self.status.set_connected(false);
+        self.status.set_phase(ConnectionPhase::Idle);
+    }
+
+    /// 等旧会话退出后再解除配对，避免旧线程把已清理的信任重新写入。
+    fn forget_devices(&mut self) {
+        if self.ui_preview {
+            if let Ok(mut result) = self.operation_result.lock() {
+                *result = Some(Ok("预览模式：未更改实际设备配对。".into()));
+            }
+            return;
+        }
+        self.stop();
+        let previous = self.thread.take();
+        let result = Arc::clone(&self.operation_result);
+        self.thread = Some(std::thread::spawn(move || {
+            if let Some(previous) = previous {
+                let _ = previous.join();
+            }
+            let outcome = daemon::forget_paired_devices().map(|()| {
+                "本机已忘记设备。请在另一台电脑上也先忘记设备，再重新连接并核对配对码。".into()
+            });
+            if let Ok(mut shared) = result.lock() {
+                *shared = Some(outcome);
+            }
+        }));
+    }
+
+    fn forget_device(&mut self, fingerprint: [u8; 32]) {
+        self.stop();
+        if self.ui_preview {
+            return;
+        }
+        let previous = self.thread.take();
+        let result = self.operation_result.clone();
+        self.thread = Some(std::thread::spawn(move || {
+            if let Some(previous) = previous {
+                let _ = previous.join();
+            }
+            let outcome = daemon::forget_device(&fingerprint)
+                .map(|()| "本机已撤销这台设备的信任；另一端需分别操作。".into());
+            *result.lock().unwrap_or_else(|e| e.into_inner()) = Some(outcome);
+        }));
+    }
+
+    fn take_operation_result(&self) -> Option<Result<String, String>> {
+        self.operation_result.lock().ok()?.take()
     }
 }
 
@@ -278,10 +367,25 @@ fn install_cjk_font(ctx: &egui::Context) {
                 Arc::new(egui::FontData::from_owned(bytes)),
             );
             if let Some(f) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
-                f.insert(0, "cjk".to_owned());
+                // 中文字体作为回退，避免旧系统黑体的拉丁字形覆盖原生界面字体。
+                f.push("cjk".to_owned());
             }
             if let Some(f) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
                 f.push("cjk".to_owned());
+            }
+            let system_font = if cfg!(target_os = "macos") {
+                "/System/Library/Fonts/SFNS.ttf"
+            } else {
+                "C:\\Windows\\Fonts\\segoeui.ttf"
+            };
+            if let Ok(bytes) = std::fs::read(system_font) {
+                fonts.font_data.insert(
+                    "system-ui".to_owned(),
+                    Arc::new(egui::FontData::from_owned(bytes)),
+                );
+                if let Some(f) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+                    f.insert(0, "system-ui".to_owned());
+                }
             }
             ctx.set_fonts(fonts);
             tracing::info!(target: "mouseshare::ui", font = path, "已加载中文字体");
@@ -314,12 +418,12 @@ fn load_tray_icon() -> Option<Icon> {
 /// 系统托盘的菜单项更新在部分平台/版本不可靠（真机回报：点暂停后文字不变）。
 fn build_tray_menu(running: bool) -> Menu {
     let toggle_label = if running {
-        "暂停互控"
+        "暂停连接"
     } else {
-        "启用互控"
+        "连接设备"
     };
     let toggle = MenuItem::with_id("toggle", toggle_label, true, None);
-    let settings = MenuItem::with_id("settings", "设置…", true, None);
+    let settings = MenuItem::with_id("settings", "打开工作空间…", true, None);
     let quit = MenuItem::with_id("quit", "退出 Fesilent Mouse", true, None);
     let menu = Menu::new();
     let _ = menu.append_items(&[&toggle, &settings, &PredefinedMenuItem::separator(), &quit]);
@@ -359,6 +463,9 @@ enum UserEvent {
     Repaint(Duration),
     /// 请求显示设置窗口（大文件待确认时由传输中心触发，隐藏态也能弹出）。
     ShowWindow,
+    /// 首次配对需核对短认证串，窗口隐藏时也必须能发现请求。
+    PairingRequested,
+    QuitReady,
 }
 
 struct App {
@@ -388,19 +495,57 @@ struct App {
     connection_notice: Option<String>,
     form_error: Option<String>,
     local_ips: Vec<String>,
+    settings_notice: Option<(String, std::time::Instant)>,
+    confirm_forget_devices: bool,
+    ui_preview: bool,
+    pending_forget_device: Option<String>,
+    forget_all_pending: bool,
+    quitting: bool,
 }
 
 impl App {
     fn new(args: Args, first_run: bool, proxy: EventLoopProxy<UserEvent>) -> Self {
-        let mut cfg = config::load();
-        if first_run {
+        let ui_preview = ui_preview_enabled();
+        let mut cfg = if ui_preview {
+            Config::default()
+        } else {
+            config::load()
+        };
+        if first_run && !ui_preview {
             cfg = Config::from_args(&args);
             let _ = config::save(&cfg);
+        }
+        if ui_preview && std::env::var("FESILENT_UI_PREVIEW_DEVICES").ok().as_deref() == Some("1") {
+            for (fingerprint, name, side) in [
+                ([1; 32], "书房电脑 · 预览", ms_proto::Edge::Right),
+                ([2; 32], "笔记本 · 预览", ms_proto::Edge::Left),
+            ] {
+                let _ = cfg
+                    .devices
+                    .upsert_authenticated(fingerprint, name, None, side);
+            }
+            let _ = cfg
+                .devices
+                .select(&ms_core::topology::DeviceId::from_fingerprint([1; 32]).to_string());
         }
         let peer_ip = cfg.connect.clone().unwrap_or_default();
         let manual_connection = !peer_ip.is_empty();
         let config = Arc::new(Mutex::new(cfg));
         let handle = DaemonHandle::new(Arc::clone(&config), args.log_dir.clone());
+        if ui_preview {
+            match std::env::var("FESILENT_UI_PREVIEW_STATE").ok().as_deref() {
+                Some("connected") => {
+                    handle.running.store(true, Ordering::Release);
+                    handle.status.set_connected(true);
+                    handle.status.set_rtt_ms(3);
+                }
+                Some("reconnecting") => {
+                    handle.running.store(true, Ordering::Release);
+                    handle.status.set_phase(ConnectionPhase::Reconnecting);
+                }
+                _ => {}
+            }
+        }
         // 剪贴板历史容量按配置生效（T-808；0=关闭，改 config.json 后重启生效）
         cliphist::set_cap(
             config
@@ -420,7 +565,7 @@ impl App {
             handle,
             config,
             peer_ip,
-            autostart_on: autostart_enabled(),
+            autostart_on: !ui_preview && autostart_enabled(),
             toggle_label: "启用互控",
             hide_requested: false,
             diag_result: None,
@@ -430,6 +575,21 @@ impl App {
             connection_notice: None,
             form_error: None,
             local_ips: views::local_ipv4_addresses(),
+            settings_notice: None,
+            confirm_forget_devices: false,
+            pending_forget_device: None,
+            forget_all_pending: false,
+            quitting: false,
+            ui_preview,
+        }
+    }
+
+    fn is_mac_ui(&self) -> bool {
+        if self.ui_preview {
+            preview_platform(std::env::var("FESILENT_UI_PREVIEW").ok().as_deref())
+                .unwrap_or(cfg!(target_os = "macos"))
+        } else {
+            cfg!(target_os = "macos")
         }
     }
 
@@ -463,6 +623,10 @@ impl App {
     fn on_menu(&mut self, id: &str) {
         match id {
             "toggle" => {
+                if self.quitting || self.pending_forget_device.is_some() || self.forget_all_pending
+                {
+                    return;
+                }
                 let running = if self.handle.is_running() {
                     self.handle.stop();
                     false
@@ -478,8 +642,20 @@ impl App {
                 self.redraw();
             }
             "quit" => {
+                if self.quitting || self.pending_forget_device.is_some() || self.forget_all_pending
+                {
+                    return;
+                }
+                self.quitting = true;
                 self.handle.stop();
-                std::process::exit(0);
+                let previous = self.handle.thread.take();
+                let proxy = self.proxy.clone();
+                std::thread::spawn(move || {
+                    if let Some(thread) = previous {
+                        let _ = thread.join();
+                    }
+                    let _ = proxy.send_event(UserEvent::QuitReady);
+                });
             }
             _ => {}
         }
@@ -487,9 +663,9 @@ impl App {
 
     fn set_toggle_text(&mut self, running: bool) {
         let label = if running {
-            "暂停互控"
+            "暂停连接"
         } else {
-            "启用互控"
+            "连接设备"
         };
         if self.toggle_label == label {
             return;
@@ -503,6 +679,47 @@ impl App {
 
     /// 渲染一帧设置界面。
     fn redraw(&mut self) {
+        if let Some(outcome) = self.handle.take_operation_result() {
+            match outcome {
+                Ok(message) => {
+                    if let Some(fingerprint) = self.pending_forget_device.take() {
+                        let mut cfg = self
+                            .config
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .clone();
+                        let selected =
+                            cfg.devices.active_target.as_deref() == Some(fingerprint.as_str());
+                        cfg.devices.remove(&fingerprint);
+                        if selected {
+                            cfg.connect = None;
+                            self.manual_connection = false;
+                            self.peer_ip.clear();
+                        }
+                        self.store_config(&cfg);
+                    }
+                    if self.forget_all_pending {
+                        let mut cfg = self
+                            .config
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .clone();
+                        cfg.devices = crate::devices::DeviceCatalog::default();
+                        cfg.connect = None;
+                        self.store_config(&cfg);
+                        self.manual_connection = false;
+                        self.peer_ip.clear();
+                        self.forget_all_pending = false;
+                    }
+                    self.settings_notice = Some((message, std::time::Instant::now()));
+                }
+                Err(error) => {
+                    self.pending_forget_device = None;
+                    self.forget_all_pending = false;
+                    self.form_error = Some(error);
+                }
+            }
+        }
         let (Some(mut egui_glow), Some(gl_window)) = (self.egui_glow.take(), self.gl_window.take())
         else {
             return;
@@ -512,7 +729,7 @@ impl App {
             use egui_glow::glow::HasContext as _;
             // SAFETY: gl 由 resumed 初始化，当前上下文有效
             unsafe {
-                gl.clear_color(0.953, 0.961, 0.973, 1.0);
+                gl.clear_color(0.973, 0.969, 0.976, 1.0);
                 gl.clear(egui_glow::glow::COLOR_BUFFER_BIT);
             }
         }
@@ -576,8 +793,9 @@ impl ApplicationHandler<UserEvent> for App {
             }
         };
 
-        let show_window =
-            self.first_run || std::env::var("FESILENT_SHOW_WINDOW").is_ok_and(|value| value == "1");
+        let show_window = self.ui_preview
+            || self.first_run
+            || std::env::var("FESILENT_SHOW_WINDOW").is_ok_and(|value| value == "1");
         if show_window {
             gl_window.window().set_visible(true);
         }
@@ -590,7 +808,7 @@ impl ApplicationHandler<UserEvent> for App {
         let _ = &self.args;
 
         // 任务2：非首启且用户曾启用过 → 打开软件即自动开始互控，免手动点「启用」
-        if !self.first_run {
+        if !self.first_run && !self.ui_preview {
             let auto = self.config.lock().map(|c| c.auto_start).unwrap_or(false);
             if auto {
                 tracing::info!(target: "mouseshare::ui", "auto_start 已开，自动启动互控");
@@ -636,8 +854,9 @@ impl ApplicationHandler<UserEvent> for App {
         }
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
+            UserEvent::QuitReady => event_loop.exit(),
             UserEvent::Menu(id) => self.on_menu(&id),
             UserEvent::Repaint(delay) => {
                 self.repaint_after = delay;
@@ -652,6 +871,20 @@ impl ApplicationHandler<UserEvent> for App {
                 self.show_window();
                 self.redraw();
             }
+            UserEvent::PairingRequested => {
+                if self.handle.status.pending_pairing().is_some() {
+                    self.section = views::Section::Connection;
+                    self.show_window();
+                    self.redraw();
+                }
+            }
+        }
+    }
+
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        self.handle.stop();
+        if let Some(thread) = self.handle.thread.take() {
+            let _ = thread.join();
         }
     }
 
@@ -724,7 +957,8 @@ fn spawn_control_listener(proxy: EventLoopProxy<UserEvent>) {
 
 /// 运行 UI（托盘 + 设置窗口）。返回是否正常结束。
 pub fn run(args: Args) -> bool {
-    let first_run = config::config_path().map(|p| !p.exists()).unwrap_or(true);
+    let first_run =
+        ui_preview_enabled() || config::config_path().map(|p| !p.exists()).unwrap_or(true);
     let event_loop = match EventLoop::<UserEvent>::with_user_event().build() {
         Ok(e) => e,
         Err(e) => {
@@ -741,20 +975,32 @@ pub fn run(args: Args) -> bool {
     }));
 
     #[cfg(debug_assertions)]
-    spawn_control_listener(proxy.clone());
-    spawn_transfer_watcher(proxy.clone());
-
-    let mut app = App::new(args, first_run, proxy);
+    if !ui_preview_enabled() {
+        spawn_control_listener(proxy.clone());
+    }
+    let mut app = App::new(args, first_run, proxy.clone());
+    if !app.ui_preview {
+        spawn_transfer_watcher(proxy, Arc::clone(&app.handle.status));
+    }
     event_loop.run_app(&mut app).is_ok()
 }
 
 /// 后台轮询传输中心：有大文件待确认时请求弹出设置窗口（隐藏态也能弹），
 /// 并在有进行中传输时驱动窗口重绘以刷新进度。
-fn spawn_transfer_watcher(proxy: EventLoopProxy<UserEvent>) {
+fn spawn_transfer_watcher(proxy: EventLoopProxy<UserEvent>, status: Arc<ConnStatus>) {
     std::thread::spawn(move || {
+        let mut pairing_shown = None;
         loop {
             std::thread::sleep(Duration::from_millis(200));
             let center = crate::transfers::center();
+            let pairing_pending = status.pending_pairing();
+            if pairing_pending.is_some()
+                && pairing_pending != pairing_shown
+                && proxy.send_event(UserEvent::PairingRequested).is_err()
+            {
+                return;
+            }
+            pairing_shown = pairing_pending;
             if center.take_show_request() && proxy.send_event(UserEvent::ShowWindow).is_err() {
                 return;
             }
@@ -767,4 +1013,37 @@ fn spawn_transfer_watcher(proxy: EventLoopProxy<UserEvent>) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn 预览必须显式选择且启停和解除配对不创建真实后台线程() {
+        assert_eq!(preview_platform(Some("windows")), Some(false));
+        assert_eq!(preview_platform(Some("mac")), Some(true));
+        assert_eq!(preview_platform(Some("false")), None);
+        assert_eq!(preview_platform(None), None);
+
+        let mut handle = DaemonHandle::new(Arc::new(Mutex::new(Config::default())), None);
+        handle.ui_preview = true;
+        handle.start();
+        assert!(handle.is_running());
+        assert!(!handle.status.connected());
+        assert!(
+            handle.thread.is_none(),
+            "隔离预览不能创建会执行捕获和联网的守护线程"
+        );
+        handle.stop();
+        assert!(!handle.is_running());
+        assert_eq!(handle.status.phase(), ConnectionPhase::Idle);
+        handle.forget_devices();
+        assert!(handle.thread.is_none(), "预览解除配对不能启动文件清理线程");
+        assert!(
+            handle
+                .take_operation_result()
+                .is_some_and(|result| result.is_ok())
+        );
+    }
 }

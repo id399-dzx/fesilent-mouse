@@ -3,6 +3,66 @@
 
 use std::collections::BTreeSet;
 
+/// 真实会话使用的可配置组合键；修饰键按左右任意一侧匹配。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Shortcut {
+    pub ctrl: bool,
+    pub alt: bool,
+    pub shift: bool,
+    pub meta: bool,
+    pub key: u16,
+}
+
+impl Shortcut {
+    pub fn valid(self) -> bool {
+        self.key >= 4
+            && self.key < 0xE0
+            && [self.ctrl, self.alt, self.shift, self.meta]
+                .into_iter()
+                .filter(|v| *v)
+                .count()
+                >= 2
+    }
+}
+
+/// 固定容量按键状态，捕获消费路径不为每次按键分配内存。
+pub struct ShortcutTracker {
+    pressed: [bool; 256],
+}
+
+impl Default for ShortcutTracker {
+    fn default() -> Self {
+        Self {
+            pressed: [false; 256],
+        }
+    }
+}
+
+impl ShortcutTracker {
+    pub fn pressed_modifiers(&self) -> impl Iterator<Item = u16> + '_ {
+        (0xE0..=0xE7).filter(|hid| self.pressed[*hid as usize])
+    }
+    pub fn update(&mut self, hid: u16, down: bool, binding: Shortcut) -> bool {
+        let Some(previous) = self.pressed.get_mut(hid as usize) else {
+            return false;
+        };
+        let repeated = *previous;
+        *previous = down;
+        let held = |a: usize, b: usize| self.pressed[a] || self.pressed[b];
+        down && !repeated
+            && hid == binding.key
+            && binding.valid()
+            && held(0xE0, 0xE4) == binding.ctrl
+            && held(0xE2, 0xE6) == binding.alt
+            && held(0xE1, 0xE5) == binding.shift
+            && held(0xE3, 0xE7) == binding.meta
+    }
+
+    pub fn reset(&mut self) {
+        self.pressed.fill(false);
+    }
+}
+
 // HID 修饰键码（page 0x07）
 const HID_LCTRL: u16 = 0xE0;
 const HID_LALT: u16 = 0xE2;

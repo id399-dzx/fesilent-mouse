@@ -10,3 +10,4 @@ pub mod layout;
 pub mod pipeline;
 pub mod safety;
 pub mod shadow;
+pub mod topology;

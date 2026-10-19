@@ -6,6 +6,7 @@
 
 use std::collections::BTreeSet;
 
+use ms_platform::synthetic::OWN_EVENT_MARKER;
 use ms_platform::{Button, HidKey, InputInject, Result};
 
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -21,6 +22,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::event_decode::normalize_virtual_desktop;
+use crate::inject_state::{check_send_count, release_pending};
 use crate::keymap::hid_to_scancode;
 
 const WHEEL_DELTA: i32 = 120;
@@ -47,11 +49,17 @@ impl Default for WinInject {
     }
 }
 
-fn send(inputs: &[INPUT]) {
+fn send(inputs: &[INPUT]) -> Result<()> {
     // SAFETY: inputs 为有效 INPUT 切片，cbSize 取结构体大小
-    unsafe {
-        SendInput(inputs, std::mem::size_of::<INPUT>() as i32);
+    let sent = unsafe { SendInput(inputs, std::mem::size_of::<INPUT>() as i32) };
+    if sent as usize == inputs.len() {
+        return Ok(());
     }
+    check_send_count(
+        sent,
+        inputs.len(),
+        std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+    )
 }
 
 fn key_input(scancode: u16, extended: bool, down: bool) -> INPUT {
@@ -70,7 +78,7 @@ fn key_input(scancode: u16, extended: bool, down: bool) -> INPUT {
                 wScan: scancode,
                 dwFlags: KEYBD_EVENT_FLAGS(flags.0),
                 time: 0,
-                dwExtraInfo: 0,
+                dwExtraInfo: OWN_EVENT_MARKER as usize,
             },
         },
     }
@@ -86,7 +94,7 @@ fn mouse_input(flags: MOUSE_EVENT_FLAGS, dx: i32, dy: i32, mouse_data: i32) -> I
                 mouseData: mouse_data as u32,
                 dwFlags: flags,
                 time: 0,
-                dwExtraInfo: 0,
+                dwExtraInfo: OWN_EVENT_MARKER as usize,
             },
         },
     }
@@ -152,7 +160,7 @@ impl InputInject for WinInject {
     fn key(&mut self, key: HidKey, down: bool) -> Result<()> {
         match hid_to_scancode(key) {
             Some((sc, ext)) => {
-                send(&[key_input(sc, ext, down)]);
+                send(&[key_input(sc, ext, down)])?;
                 if down {
                     self.keys.insert(key.0);
                 } else {
@@ -183,13 +191,12 @@ impl InputInject for WinInject {
             nx,
             ny,
             0,
-        )]);
-        Ok(())
+        )])
     }
 
     fn mouse_button(&mut self, btn: Button, down: bool) -> Result<()> {
         let (flags, data) = button_flags(btn, down);
-        send(&[mouse_input(flags, 0, 0, data)]);
+        send(&[mouse_input(flags, 0, 0, data)])?;
         if down {
             self.buttons.insert(button_code(btn));
         } else {
@@ -205,7 +212,7 @@ impl InputInject for WinInject {
                 0,
                 0,
                 (dy * WHEEL_DELTA as f64).round() as i32,
-            )]);
+            )])?;
         }
         if dx != 0.0 {
             send(&[mouse_input(
@@ -213,28 +220,36 @@ impl InputInject for WinInject {
                 0,
                 0,
                 (dx * WHEEL_DELTA as f64).round() as i32,
-            )]);
+            )])?;
         }
         Ok(())
     }
 
     fn release_all(&mut self) -> Result<()> {
-        let keys: Vec<u16> = self.keys.iter().copied().collect();
-        for hid in keys {
+        let keys_result = release_pending(&mut self.keys, |hid| {
             if let Some((sc, ext)) = hid_to_scancode(HidKey(hid)) {
-                send(&[key_input(sc, ext, false)]);
+                send(&[key_input(sc, ext, false)])
+            } else {
+                Ok(())
             }
-        }
-        self.keys.clear();
-        let btns: Vec<u8> = self.buttons.iter().copied().collect();
-        for code in btns {
+        });
+        let buttons_result = release_pending(&mut self.buttons, |code| {
             if let Some(btn) = code_button(code) {
                 let (flags, data) = button_flags(btn, false);
-                send(&[mouse_input(flags, 0, 0, data)]);
+                send(&[mouse_input(flags, 0, 0, data)])
+            } else {
+                Ok(())
             }
+        });
+        keys_result.and(buttons_result)
+    }
+}
+
+impl Drop for WinInject {
+    fn drop(&mut self) {
+        if let Err(error) = self.release_all() {
+            tracing::warn!(target: "mouseshare::win", reason = "LocalShutdown", %error, "退出注入器时仍有按键未能释放");
         }
-        self.buttons.clear();
-        Ok(())
     }
 }
 
@@ -247,4 +262,21 @@ fn code_button(code: u8) -> Option<Button> {
         4 => Button::X2,
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ms_platform::synthetic::is_own_event;
+
+    #[test]
+    fn 键盘与鼠标输入构造都携带自家标记但不执行注入() {
+        let key = key_input(0x1E, false, true);
+        let mouse = mouse_input(MOUSEEVENTF_MOVE, 0, 0, 0);
+        // SAFETY: 两个构造器分别设置 INPUT_KEYBOARD/INPUT_MOUSE，读取对应 union 成员。
+        unsafe {
+            assert!(is_own_event(key.Anonymous.ki.dwExtraInfo as u64));
+            assert!(is_own_event(mouse.Anonymous.mi.dwExtraInfo as u64));
+        }
+    }
 }

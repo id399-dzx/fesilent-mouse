@@ -21,6 +21,33 @@ pub struct ExitInfo {
     pub ratio: f32,
 }
 
+/// 非零沿边偏移以来源边起点为0、目标顶/左为offset；仅重叠段可以跨屏。
+/// offset=0的旧比例映射由调用方保留，不改变已有配置手感。
+pub fn offset_entry_ratio(
+    own: &Rect,
+    peer: &Rect,
+    pos: Point,
+    side: Edge,
+    offset: f64,
+) -> Option<f32> {
+    let (along, own_len, peer_len) = match side {
+        Edge::Left | Edge::Right => (pos.y - own.y, own.h, peer.h),
+        Edge::Top | Edge::Bottom => (pos.x - own.x, own.w, peer.w),
+    };
+    if !along.is_finite()
+        || !offset.is_finite()
+        || !peer_len.is_finite()
+        || !own_len.is_finite()
+        || peer_len <= 0.0
+        || own_len <= 0.0
+    {
+        return None;
+    }
+    let target = along - offset;
+    (along >= 0.0 && along < own_len && target >= 0.0 && target < peer_len)
+        .then_some((target / peer_len) as f32)
+}
+
 /// 边的对侧。
 pub fn opposite(edge: Edge) -> Edge {
     match edge {

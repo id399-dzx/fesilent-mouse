@@ -121,8 +121,8 @@ async fn 伪造设备_持他人证书无私钥_握手被拒() {
     // Endpoint 构建可能直接拒绝密钥/证书不匹配；若能构建，握手也必须失败
     // 构建期即拒绝，或之后握手被拒/超时，都满足验证预期。
     if let Ok(ep) = Endpoint::new(loopback(), &forged) {
-        let r = tokio::time::timeout(std::time::Duration::from_secs(3), ep.connect(server_addr))
-            .await;
+        let r =
+            tokio::time::timeout(std::time::Duration::from_secs(3), ep.connect(server_addr)).await;
         if let Ok(Ok(_conn)) = r {
             panic!("伪造身份（他人证书+自己私钥）竟然握手成功");
         }

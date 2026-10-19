@@ -10,10 +10,11 @@
 use std::cell::RefCell;
 use std::ffi::c_void;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
+use ms_platform::synthetic::is_own_event;
 use ms_platform::{EventSink, InputCapture, PlatformError, Result};
 
 use crate::breaker::DisableBreaker;
@@ -49,6 +50,7 @@ const FIELD_SCROLL_AXIS2: u32 = 12;
 const FIELD_SCROLL_CONTINUOUS: u32 = 88;
 const FIELD_SCROLL_FIXED_AXIS1: u32 = 93;
 const FIELD_SCROLL_FIXED_AXIS2: u32 = 94;
+const FIELD_SOURCE_USER_DATA: u32 = 42; // kCGEventSourceUserData
 
 // CGEventTap 位置/放置/选项
 const HID_EVENT_TAP: u32 = 0; // kCGHIDEventTap
@@ -86,10 +88,17 @@ unsafe extern "C" {
     ) -> CFRunLoopSourceRef;
     fn CFRunLoopGetCurrent() -> CFRunLoopRef;
     fn CFRunLoopAddSource(rl: CFRunLoopRef, source: CFRunLoopSourceRef, mode: CFStringRef);
-    fn CFRunLoopRun();
+    fn CFRunLoopRemoveSource(rl: CFRunLoopRef, source: CFRunLoopSourceRef, mode: CFStringRef);
+    fn CFRunLoopRunInMode(
+        mode: CFStringRef,
+        seconds: f64,
+        return_after_source_handled: bool,
+    ) -> i32;
     fn CFRunLoopStop(rl: CFRunLoopRef);
+    fn CFMachPortInvalidate(port: CFMachPortRef);
     fn CFRelease(cf: CFTypeRef);
     static kCFRunLoopCommonModes: CFStringRef;
+    static kCFRunLoopDefaultMode: CFStringRef;
 }
 
 #[link(name = "ApplicationServices", kind = "framework")]
@@ -197,6 +206,21 @@ extern "C" fn tap_callback(
     // 且回调仅在单一 run loop 线程被非重入地调用。
     let ctx = unsafe { &*(user as *const Context) };
 
+    // 禁用通知可能没有 CGEvent，且始终必须进入恢复/熔断分支。
+    if !event.is_null()
+        && !matches!(
+            etype,
+            ev_type::TAP_DISABLED_BY_TIMEOUT | ev_type::TAP_DISABLED_BY_USER_INPUT
+        )
+    {
+        // SAFETY: 普通回调提供有效 CGEvent；字段 42 是事件源的用户标记。
+        let marker = unsafe { CGEventGetIntegerValueField(event, FIELD_SOURCE_USER_DATA) } as u64;
+        if is_own_event(marker) {
+            // 透传给本机 OS，但不送 sink，不让远端注入再触发本机切换/锁定快捷键。
+            return event;
+        }
+    }
+
     // SAFETY: event 为回调收到的有效指针
     let fields = unsafe { extract_fields(event, etype) };
 
@@ -229,6 +253,7 @@ extern "C" fn tap_callback(
                 unsafe { CGEventTapEnable(ctx.port, true) };
             } else {
                 // 频繁禁用，熔断：标记失败并停止 run loop（DisconnectReason::TapDisabledLoop）
+                ctx.grab.store(false, Ordering::Release);
                 ctx.failed.store(true, Ordering::Release);
                 // SAFETY: 在 run loop 线程内调用，CFRunLoopStop 是线程安全的 CF 调用
                 unsafe { CFRunLoopStop(CFRunLoopGetCurrent()) };
@@ -244,7 +269,7 @@ extern "C" fn tap_callback(
 pub struct MacCapture {
     grab: Arc<AtomicBool>,
     failed: Arc<AtomicBool>,
-    runloop: Arc<AtomicPtr<c_void>>,
+    stop_requested: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     confined: bool,
 }
@@ -254,7 +279,7 @@ impl MacCapture {
         Self {
             grab: Arc::new(AtomicBool::new(false)),
             failed: Arc::new(AtomicBool::new(false)),
-            runloop: Arc::new(AtomicPtr::new(std::ptr::null_mut())),
+            stop_requested: Arc::new(AtomicBool::new(false)),
             thread: None,
             confined: false,
         }
@@ -279,13 +304,14 @@ impl InputCapture for MacCapture {
         }
         self.grab.store(grab, Ordering::Release);
         self.failed.store(false, Ordering::Release);
+        self.stop_requested.store(false, Ordering::Release);
 
         let grab_flag = Arc::clone(&self.grab);
         let failed_flag = Arc::clone(&self.failed);
-        let runloop_slot = Arc::clone(&self.runloop);
+        let stop_requested = Arc::clone(&self.stop_requested);
 
         // 用 channel 把"tap 创建是否成功"回传给 start()，以便同步返回权限错误
-        let (tx, rx) = std::sync::mpsc::channel::<std::result::Result<(), String>>();
+        let (tx, rx) = std::sync::mpsc::channel::<Result<()>>();
 
         let handle = std::thread::Builder::new()
             .name("ms-mac-capture".into())
@@ -319,16 +345,26 @@ impl InputCapture for MacCapture {
                     )
                 };
                 if port.is_null() {
-                    let _ = tx.send(Err("CGEventTapCreate 返回 NULL（多为辅助功能未授权）".into()));
+                    let _ = tx.send(Err(PlatformError::PermissionDenied(
+                        "CGEventTapCreate 返回 NULL，请检查辅助功能授权".into(),
+                    )));
                     return;
                 }
                 ctx.port = port;
 
                 // SAFETY: port 有效；创建 run loop source 并挂到当前线程 run loop
                 let source = unsafe { CFMachPortCreateRunLoopSource(std::ptr::null(), port, 0) };
-                // SAFETY: 获取当前线程 run loop 并存出，供 stop() 调用 CFRunLoopStop
+                if source.is_null() {
+                    // SAFETY: port 由本线程创建且尚未挂入 run loop。
+                    unsafe {
+                        CFMachPortInvalidate(port);
+                        CFRelease(port as CFTypeRef);
+                    }
+                    let _ = tx.send(Err(PlatformError::Api("无法创建 CGEventTap run loop source".into())));
+                    return;
+                }
+                // SAFETY: 获取当前线程 run loop；其引用不跨线程传递。
                 let rl = unsafe { CFRunLoopGetCurrent() };
-                runloop_slot.store(rl, Ordering::Release);
                 // SAFETY: rl/source/常量模式均有效
                 unsafe {
                     CFRunLoopAddSource(rl, source, kCFRunLoopCommonModes);
@@ -338,17 +374,22 @@ impl InputCapture for MacCapture {
                 let _ = tx.send(Ok(()));
                 tracing::info!(target: "mouseshare::mac", "CGEventTap 已启动");
 
-                // SAFETY: 阻塞运行当前线程 run loop，直到 stop()/熔断调用 CFRunLoopStop
-                unsafe { CFRunLoopRun() };
+                while !stop_requested.load(Ordering::Acquire) && !ctx.failed.load(Ordering::Acquire) {
+                    // SAFETY: source 属于当前 run loop。定时返回检查取消位，避免 start
+                    // 就绪与 run loop 开始之间的 stop 丢失，也不跨线程解引用 CF 指针。
+                    unsafe { CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.1, false) };
+                }
+                ctx.grab.store(false, Ordering::Release);
 
                 // 退出清理
                 // SAFETY: port/source 为本线程创建，停止后释放
                 unsafe {
                     CGEventTapEnable(port, false);
+                    CFRunLoopRemoveSource(rl, source, kCFRunLoopCommonModes);
+                    CFMachPortInvalidate(port);
                     CFRelease(source as CFTypeRef);
                     CFRelease(port as CFTypeRef);
                 }
-                runloop_slot.store(std::ptr::null_mut(), Ordering::Release);
                 tracing::info!(target: "mouseshare::mac", "CGEventTap 线程退出");
                 // ctx 在此 drop
             })
@@ -359,11 +400,16 @@ impl InputCapture for MacCapture {
                 self.thread = Some(handle);
                 Ok(())
             }
-            Ok(Err(msg)) => {
+            Ok(Err(error)) => {
                 let _ = handle.join();
-                Err(PlatformError::PermissionDenied(msg))
+                self.grab.store(false, Ordering::Release);
+                Err(error)
             }
-            Err(_) => Err(PlatformError::Api("捕获线程未就绪即退出".into())),
+            Err(_) => {
+                let _ = handle.join();
+                self.grab.store(false, Ordering::Release);
+                Err(PlatformError::Api("捕获线程未就绪即退出".into()))
+            }
         }
     }
 
@@ -373,13 +419,25 @@ impl InputCapture for MacCapture {
     }
 
     fn stop(&mut self) -> Result<()> {
-        let rl = self.runloop.load(Ordering::Acquire);
-        if !rl.is_null() {
-            // SAFETY: CFRunLoopStop 是线程安全的 CF 调用，rl 为捕获线程的 run loop
-            unsafe { CFRunLoopStop(rl) };
-        }
+        // TECH-REVIEW A-1/B-2：停捕获的兜底同样必须先解除拦截并恢复本机光标。
+        // 跨设备 release_all 由上层安全回退事务在 stop 前执行。
+        self.grab.store(false, Ordering::Release);
+        let cursor_result = self.confine_cursor(false);
+        self.stop_requested.store(true, Ordering::Release);
         if let Some(h) = self.thread.take() {
             let _ = h.join();
+        }
+        cursor_result
+    }
+
+    fn check_health(&self) -> Result<()> {
+        if self.is_failed() {
+            return Err(PlatformError::Api(
+                "CGEventTap 频繁停用，捕获已熔断（TapDisabledLoop）".into(),
+            ));
+        }
+        if self.thread.as_ref().is_none_or(JoinHandle::is_finished) {
+            return Err(PlatformError::Api("CGEventTap 捕获线程未运行".into()));
         }
         Ok(())
     }
@@ -390,15 +448,27 @@ impl InputCapture for MacCapture {
         if on == self.confined {
             return Ok(());
         }
-        // SAFETY: 均为无参数/标量的 CoreGraphics 调用，无别名要求
-        unsafe {
+        // SAFETY: 均为无参数/标量的 CoreGraphics 调用，无别名要求。
+        // 恢复时两项都尝试，不能因恢复鼠标关联失败就跳过显示光标。
+        let (association_error, visibility_error) = unsafe {
             if on {
-                CGAssociateMouseAndMouseCursorPosition(false);
-                CGDisplayHideCursor(HID_DISPLAY);
+                (
+                    CGAssociateMouseAndMouseCursorPosition(false),
+                    CGDisplayHideCursor(HID_DISPLAY),
+                )
             } else {
-                CGAssociateMouseAndMouseCursorPosition(true);
-                CGDisplayShowCursor(HID_DISPLAY);
+                (
+                    CGAssociateMouseAndMouseCursorPosition(true),
+                    CGDisplayShowCursor(HID_DISPLAY),
+                )
             }
+        };
+        if association_error != 0 || visibility_error != 0 {
+            // 开启可能仅部分成功；保留标记，让安全回退/Drop 继续尝试恢复。
+            self.confined = true;
+            return Err(PlatformError::Api(format!(
+                "切换光标限制失败（on={on}, association={association_error}, visibility={visibility_error}）"
+            )));
         }
         self.confined = on;
         Ok(())
@@ -408,5 +478,29 @@ impl InputCapture for MacCapture {
 impl Drop for MacCapture {
     fn drop(&mut self) {
         let _ = self.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used)] // 测试断言；不执行真实 tap 捕获或光标隐藏。
+    use super::*;
+
+    #[test]
+    fn 停止捕获必定解除grab并允许重复停止() {
+        let mut capture = MacCapture::new();
+        capture.set_grab(true).expect("设置标记");
+        capture.stop().expect("首次停止");
+        assert!(!capture.grab.load(Ordering::Acquire));
+        capture.stop().expect("重复停止");
+        assert!(capture.check_health().is_err(), "停止后不能报告捕获健康");
+    }
+
+    #[test]
+    fn 熔断状态由trait健康检查上报() {
+        let capture = MacCapture::new();
+        capture.failed.store(true, Ordering::Release);
+        let error = capture.check_health().expect_err("熔断必须返回错误");
+        assert!(error.to_string().contains("TapDisabledLoop"));
     }
 }

@@ -13,4 +13,6 @@ cp target/x86_64-pc-windows-gnu/release/fesilent-mouse.exe "$OUT/fesilent-mouse.
   cd "$OUT"
   shasum -a 256 fesilent-mouse-macOS-arm64.zip fesilent-mouse.exe > SHA256SUMS
 )
+python3 -B scripts/verify-package.py --kind macos --artifact "$OUT/fesilent-mouse-macOS-arm64.zip" --checksums "$OUT/SHA256SUMS" --smoke
+python3 -B scripts/verify-package.py --kind windows --artifact "$OUT/fesilent-mouse.exe" --checksums "$OUT/SHA256SUMS"
 echo "v${VERSION} 构建资产已生成：${OUT}"

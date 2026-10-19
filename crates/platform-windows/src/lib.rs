@@ -9,6 +9,9 @@ pub mod clipboard_fmt;
 pub mod event_decode;
 pub mod keymap;
 
+#[cfg(any(target_os = "windows", test))]
+mod inject_state;
+
 #[cfg(target_os = "windows")]
 pub mod capture;
 

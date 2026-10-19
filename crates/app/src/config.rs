@@ -9,6 +9,65 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShortcutConfig {
+    pub ctrl: bool,
+    pub alt: bool,
+    pub shift: bool,
+    pub meta: bool,
+    pub key: u16,
+}
+
+impl ShortcutConfig {
+    pub fn binding(self) -> ms_core::input_map::Shortcut {
+        ms_core::input_map::Shortcut {
+            ctrl: self.ctrl,
+            alt: self.alt,
+            shift: self.shift,
+            meta: self.meta,
+            key: self.key,
+        }
+    }
+    pub fn label(self) -> String {
+        let mut parts = Vec::new();
+        if self.ctrl {
+            parts.push("Ctrl".to_owned());
+        }
+        if self.alt {
+            parts.push("Alt".to_owned());
+        }
+        if self.shift {
+            parts.push("Shift".to_owned());
+        }
+        if self.meta {
+            parts.push("Win/⌘".to_owned());
+        }
+        parts.push(match self.key {
+            4..=29 => char::from(b'A' + (self.key - 4) as u8).to_string(),
+            0x3A..=0x45 => format!("F{}", self.key - 0x39),
+            0x2C => "空格".into(),
+            _ => format!("HID {:02X}", self.key),
+        });
+        parts.join(" + ")
+    }
+}
+
+fn default_switch_shortcut() -> ShortcutConfig {
+    ShortcutConfig {
+        ctrl: true,
+        alt: true,
+        shift: false,
+        meta: false,
+        key: 0x2C,
+    }
+}
+fn default_lock_shortcut() -> ShortcutConfig {
+    ShortcutConfig {
+        key: 0x0F,
+        ..default_switch_shortcut()
+    }
+}
+
 use crate::cli::Args;
 
 pub(crate) const DEFAULT_PEER_PORT: u16 = 53728;
@@ -86,6 +145,21 @@ pub struct Config {
     /// 从属端：只被控、不主动夺取控制。
     #[serde(default)]
     pub no_takeover: bool,
+    /// Mac 主控须显式开启，兼容旧Mac始终从属的配置。
+    #[serde(default)]
+    pub mac_control: bool,
+    #[serde(default)]
+    pub display_offset: f64,
+    #[serde(default = "default_true")]
+    pub shortcuts_enabled: bool,
+    #[serde(default = "default_switch_shortcut")]
+    pub switch_shortcut: ShortcutConfig,
+    #[serde(default = "default_lock_shortcut")]
+    pub lock_shortcut: ShortcutConfig,
+    #[serde(default)]
+    pub onboarding_done: bool,
+    #[serde(default)]
+    pub devices: crate::devices::DeviceCatalog,
     /// 反转滚轮上下方向。
     #[serde(default)]
     pub invert_scroll: bool,
@@ -122,6 +196,13 @@ impl Default for Config {
             connect: None,
             side: default_side(),
             no_takeover: false,
+            mac_control: false,
+            display_offset: 0.0,
+            shortcuts_enabled: true,
+            switch_shortcut: default_switch_shortcut(),
+            lock_shortcut: default_lock_shortcut(),
+            onboarding_done: false,
+            devices: crate::devices::DeviceCatalog::default(),
             invert_scroll: false,
             scroll_speed: default_scroll_speed(),
             swap_modifiers: true,
@@ -150,6 +231,7 @@ impl Config {
             edge_push: args.edge_push,
             return_push: args.return_push,
             clip_history: default_clip_history(),
+            ..Self::default()
         }
     }
 
@@ -202,6 +284,7 @@ pub fn load() -> Config {
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
     cfg.scroll_speed = normalize_scroll_speed(cfg.scroll_speed);
+    cfg.normalize();
     cfg
 }
 
@@ -213,14 +296,52 @@ pub fn save(cfg: &Config) -> Result<(), String> {
     }
     let mut normalized = cfg.clone();
     normalized.scroll_speed = normalize_scroll_speed(normalized.scroll_speed);
+    normalized.normalize();
     let json = serde_json::to_string_pretty(&normalized).map_err(|e| e.to_string())?;
-    std::fs::write(&path, json).map_err(|e| e.to_string())
+    // 同目录先完整写临时文件，再替换，避免退出/崩溃留下半个JSON。
+    let temporary = path.with_extension("json.tmp");
+    std::fs::write(&temporary, json).map_err(|e| e.to_string())?;
+    std::fs::rename(&temporary, &path).map_err(|e| e.to_string())
+}
+
+impl Config {
+    pub fn normalize(&mut self) {
+        if !self.display_offset.is_finite() {
+            self.display_offset = 0.0;
+        }
+        self.display_offset = self.display_offset.clamp(-100_000.0, 100_000.0);
+        if !self.switch_shortcut.binding().valid() {
+            self.switch_shortcut = default_switch_shortcut();
+        }
+        if !self.lock_shortcut.binding().valid() || self.lock_shortcut == self.switch_shortcut {
+            self.lock_shortcut = default_lock_shortcut();
+            if self.lock_shortcut == self.switch_shortcut {
+                self.switch_shortcut = default_switch_shortcut();
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    #[test]
+    fn 旧配置兼容新交互且非法快捷键恢复默认() {
+        let mut config: Config = serde_json::from_str(r#"{"config_ver":1,"side":"left"}"#).unwrap();
+        assert!(!config.mac_control);
+        assert!(config.devices.records.is_empty());
+        assert!(config.shortcuts_enabled);
+        assert_eq!(config.display_offset, 0.0);
+        config.switch_shortcut = config.lock_shortcut;
+        config.display_offset = f64::INFINITY;
+        config.normalize();
+        assert_ne!(config.switch_shortcut, config.lock_shortcut);
+        assert!(config.switch_shortcut.binding().valid());
+        assert!(config.lock_shortcut.binding().valid());
+        assert_eq!(config.display_offset, 0.0);
+    }
 
     #[test]
     fn 默认配置可序列化往返() {

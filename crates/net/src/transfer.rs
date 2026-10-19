@@ -1,9 +1,8 @@
 //! 文件传输（FR-501~505，SPEC §3 Stream 3+：每文件一流）。
 //!
 //! 一条 QUIC 单向流承载：FileOffer → FileChunk… → FileDone。取消 = 重置流。
-//! 接收端先写临时文件，FileDone 后原子改名落地；取消/出错则删除临时文件（无残留）。
+//! 接收端先写独占临时文件，核验 FileDone 后原子、不覆盖地落地；取消/出错清理临时文件。
 
-use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,6 +20,7 @@ pub const FILE_CHUNK: usize = 1024 * 1024;
 
 /// 残留传输临时文件的最长保留时间。
 pub const STALE_PART_MAX_AGE: Duration = Duration::from_secs(8 * 60 * 60);
+const TEMP_PREFIX: &str = ".fesilent-transfer-";
 
 /// 进度回报。
 #[derive(Debug, Clone, Copy)]
@@ -33,6 +33,10 @@ pub struct Progress {
 pub enum TransferError {
     #[error("传输被取消")]
     Cancelled,
+    #[error("暂不支持复制文件夹，请先压缩为单个文件")]
+    Directory,
+    #[error("发送期间源文件大小发生变化，请重新复制")]
+    SourceChanged,
     #[error("网络错误: {0}")]
     Net(#[from] NetError),
     #[error("IO 错误: {0}")]
@@ -48,46 +52,124 @@ pub async fn send_file(
     cancel: Arc<AtomicBool>,
     mut on_progress: impl FnMut(Progress),
 ) -> std::result::Result<(), TransferError> {
+    if cancel.load(Ordering::Acquire) {
+        return Err(TransferError::Cancelled);
+    }
+    // Windows 的 File::open 不允许目录句柄，先给出跨平台一致的可操作提示。
+    let metadata = tokio::fs::metadata(path).await?;
+    if metadata.is_dir() {
+        return Err(TransferError::Directory);
+    }
+    if !metadata.is_file() {
+        return Err(TransferError::Proto("只能发送普通文件".into()));
+    }
     let mut file = tokio::fs::File::open(path).await?;
-    let size = file.metadata().await?.len();
+    let metadata = file.metadata().await?;
+    if metadata.is_dir() {
+        return Err(TransferError::Directory);
+    }
+    if !metadata.is_file() {
+        return Err(TransferError::Proto("只能发送普通文件".into()));
+    }
+    let size = metadata.len();
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "file".to_string());
     let id = Uuid::new_v4();
 
-    let mut stream = conn.open_msg_stream().await?;
-    stream
-        .send(&Msg::from(FileOffer { id, name, size }))
-        .await?;
-
-    let mut buf = vec![0u8; FILE_CHUNK];
-    let mut offset = 0u64;
-    loop {
-        if cancel.load(Ordering::Acquire) {
-            stream.reset();
-            return Err(TransferError::Cancelled);
-        }
-        let n = file.read(&mut buf).await?;
-        if n == 0 {
-            break;
-        }
-        stream
-            .send(&Msg::from(FileChunk {
-                id,
-                offset,
-                data: buf[..n].to_vec(),
-            }))
-            .await?;
-        offset += n as u64;
-        on_progress(Progress {
-            transferred: offset,
-            total: size,
-        });
+    let mut stream = tokio::select! {
+        biased;
+        _ = wait_cancelled(&cancel) => return Err(TransferError::Cancelled),
+        stream = conn.open_msg_stream() => stream?,
+    };
+    let result = tokio::select! {
+        biased;
+        _ = wait_cancelled(&cancel) => Err(TransferError::Cancelled),
+        result = async {
+            stream.send(&Msg::from(FileOffer { id, name, size })).await?;
+            let mut buf = vec![0u8; FILE_CHUNK];
+            let mut offset = 0u64;
+            loop {
+                let n = file.read(&mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                if n as u64 > size.saturating_sub(offset) {
+                    return Err(TransferError::SourceChanged);
+                }
+                stream.send(&Msg::from(FileChunk { id, offset, data: buf[..n].to_vec() })).await?;
+                offset += n as u64;
+                on_progress(Progress { transferred: offset, total: size });
+            }
+            if offset != size {
+                return Err(TransferError::SourceChanged);
+            }
+            stream.send(&Msg::from(FileDone { id })).await?;
+            stream.finish().await?;
+            Ok(())
+        } => result,
+    };
+    if result.is_err() {
+        // 读盘失败、源文件变化与取消均重置流，接收端不能把前缀误当完整文件。
+        stream.reset();
     }
-    stream.send(&Msg::from(FileDone { id })).await?;
-    stream.finish().await?;
-    Ok(())
+    result
+}
+
+/// 取消由 UI 原子量发布；等待网络时同样有界响应，不反复取消不安全的 recv。
+async fn wait_cancelled(cancel: &AtomicBool) {
+    while !cancel.load(Ordering::Acquire) {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// 路径守卫覆盖普通错误与 future 被 abort/drop 两种清理路径。
+struct TemporaryFile(PathBuf);
+
+impl Drop for TemporaryFile {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_file(&self.0)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(target: "mouseshare::net", path = %self.0.display(), %error, "清理传输临时文件失败");
+        }
+    }
+}
+
+fn create_temporary(dir: &Path) -> std::io::Result<(TemporaryFile, tokio::fs::File)> {
+    loop {
+        // a.txt/a.csv、同名并发与重复 offer id 均不共用暂存文件。
+        let path = dir.join(format!("{TEMP_PREFIX}{}.ms-part", Uuid::new_v4()));
+        // 创建与守卫绑定在同一个同步步骤，避免取消异步 open 后后台 IO 才创建出孤儿文件。
+        // 这里仅创建目录项，批量数据读写仍使用 Tokio；不在输入热路径运行。
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => return Ok((TemporaryFile(path), tokio::fs::File::from_std(file))),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// 同目录硬链接是原子的，遇到已存在目标必失败，消除 exists→rename 的覆盖竞争。
+/// 不支持该原语的文件系统报错，绝不回退到可能覆盖已有文件的 rename。
+async fn publish_unique(tmp: &Path, dir: &Path, name: &str) -> std::io::Result<PathBuf> {
+    for index in 0..10_000 {
+        let candidate = numbered_path(dir, name, index);
+        match tokio::fs::hard_link(tmp, &candidate).await {
+            Ok(()) => return Ok(candidate),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "同名文件过多，无法分配接收文件名",
+    ))
 }
 
 /// 接收一个文件到 `dest_dir`，返回落地路径。出错/取消时删除临时文件。
@@ -98,9 +180,18 @@ pub async fn recv_file(
     cancel: Arc<AtomicBool>,
     on_progress: impl FnMut(Progress),
 ) -> std::result::Result<PathBuf, TransferError> {
-    let mut stream = conn.accept_msg_stream().await?;
+    let mut stream = tokio::select! {
+        biased;
+        _ = wait_cancelled(&cancel) => return Err(TransferError::Cancelled),
+        stream = conn.accept_msg_stream() => stream?,
+    };
     // 首条必须是 FileOffer
-    let offer = match stream.recv().await? {
+    let first = tokio::select! {
+        biased;
+        _ = wait_cancelled(&cancel) => return Err(TransferError::Cancelled),
+        first = stream.recv() => first?,
+    };
+    let offer = match first {
         Some(Msg::FileOffer(o)) => o,
         other => {
             return Err(TransferError::Proto(format!(
@@ -121,39 +212,41 @@ pub async fn recv_on_stream(
     cancel: Arc<AtomicBool>,
     mut on_progress: impl FnMut(Progress),
 ) -> std::result::Result<PathBuf, TransferError> {
-    tokio::fs::create_dir_all(dest_dir).await?;
-    let final_path = unique_path(dest_dir, &sanitize_name(&offer.name));
-    let tmp_path = final_path.with_extension("ms-part");
-
-    // 任何失败路径都清理临时文件
-    let result = recv_into(stream, &tmp_path, offer, &cancel, &mut on_progress).await;
-    match result {
-        Ok(()) => {
-            tokio::fs::rename(&tmp_path, &final_path).await?;
-            Ok(final_path)
-        }
-        Err(e) => {
-            let _ = tokio::fs::remove_file(&tmp_path).await; // 无残留
-            Err(e)
-        }
+    if cancel.load(Ordering::Acquire) {
+        return Err(TransferError::Cancelled);
     }
+    tokio::fs::create_dir_all(dest_dir).await?;
+    let (temporary, mut file) = create_temporary(dest_dir)?;
+    // 取消选中后整个接收 future 被丢弃，不能再复用已读过部分帧的 stream。
+    let result = tokio::select! {
+        biased;
+        _ = wait_cancelled(&cancel) => Err(TransferError::Cancelled),
+        result = recv_into(stream, &mut file, offer, &mut on_progress) => result,
+    };
+    drop(file); // Windows 上同样先关闭文件，再落地/清理。
+    result?;
+    if cancel.load(Ordering::Acquire) {
+        return Err(TransferError::Cancelled);
+    }
+    Ok(publish_unique(&temporary.0, dest_dir, &sanitize_name(&offer.name)).await?)
 }
 
 async fn recv_into(
     stream: &mut MsgRecvStream,
-    tmp_path: &Path,
+    file: &mut tokio::fs::File,
     offer: &FileOffer,
-    cancel: &Arc<AtomicBool>,
     on_progress: &mut impl FnMut(Progress),
 ) -> std::result::Result<(), TransferError> {
-    let mut file = tokio::fs::File::create(tmp_path).await?;
     let mut received = 0u64;
     loop {
-        if cancel.load(Ordering::Acquire) {
-            return Err(TransferError::Cancelled);
-        }
         match stream.recv().await? {
             Some(Msg::FileChunk(c)) => {
+                if c.id != offer.id || c.offset != received {
+                    return Err(TransferError::Proto("文件分块标识或偏移不匹配".into()));
+                }
+                if c.data.is_empty() || c.data.len() as u64 > offer.size.saturating_sub(received) {
+                    return Err(TransferError::Proto("文件分块超出声明大小或为空".into()));
+                }
                 file.write_all(&c.data).await?;
                 received += c.data.len() as u64;
                 on_progress(Progress {
@@ -161,12 +254,23 @@ async fn recv_into(
                     total: offer.size,
                 });
             }
-            Some(Msg::FileDone(_)) => break,
-            Some(Msg::FileCancel(_)) | None => return Err(TransferError::Cancelled),
-            Some(other) => {
-                return Err(TransferError::Proto(format!("传输中意外消息 {other:?}")));
+            Some(Msg::FileDone(done)) => {
+                if done.id != offer.id || received != offer.size {
+                    return Err(TransferError::Proto("文件结束标识或实际大小不匹配".into()));
+                }
+                break;
             }
+            Some(Msg::FileCancel(cancel)) if cancel.id == offer.id => {
+                return Err(TransferError::Cancelled);
+            }
+            None => return Err(TransferError::Proto("文件流未完成即结束".into())),
+            Some(_) => return Err(TransferError::Proto("文件流包含不匹配的消息".into())),
         }
+    }
+    // FileDone 不是 QUIC FIN：必须消费 EOF 才能正常释放 RecvStream，否则 Drop 会
+    // STOP_SENDING(0)，把正常发送误报为取消；同时拒绝 FileDone 后的任何额外帧。
+    if stream.recv().await?.is_some() {
+        return Err(TransferError::Proto("文件结束后仍包含额外消息".into()));
     }
     file.flush().await?;
     Ok(())
@@ -185,7 +289,25 @@ pub fn sanitize_name(name: &str) -> String {
     // 仅去尾部点/空格（Windows 禁止），保留点开头的合法文件名
     let trimmed = cleaned.trim_end_matches([' ', '.']).to_string();
     if trimmed.is_empty() {
-        "file".to_string()
+        return "file".to_string();
+    }
+    if trimmed.starts_with(TEMP_PREFIX) {
+        // 保留内部暂存命名空间，收到同名真实文件时也不会被自动清理误删。
+        return format!("_{trimmed}");
+    }
+    // Windows 设备名即使带扩展名仍保留，普通字符替换无法让 CON.txt 等合法。
+    let stem = trimmed
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    if matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || stem
+            .strip_prefix("COM")
+            .or_else(|| stem.strip_prefix("LPT"))
+            .is_some_and(|suffix| suffix.len() == 1 && matches!(suffix.as_bytes()[0], b'1'..=b'9'))
+    {
+        format!("_{trimmed}")
     } else {
         trimmed
     }
@@ -200,7 +322,7 @@ pub fn default_receive_dir() -> Option<PathBuf> {
     home.map(|h| h.join("Downloads").join("FesilentMouse"))
 }
 
-/// 删除 `dir` 中最后修改时间超过 8 小时的 `.ms-part` 残留传输文件。
+/// 删除 `dir` 中最后修改时间超过 8 小时、带内部前缀及 UUID 的残留暂存文件。
 ///
 /// 仅检查目录直属文件；无法读取元数据或单个文件删除失败时跳过并记录告警，
 /// 避免清理任务影响正常文件传输。目录尚不存在视为无需清理。
@@ -214,10 +336,16 @@ pub async fn cleanup_stale_parts(dir: &Path) -> std::io::Result<usize> {
     let mut removed = 0;
     while let Some(entry) = entries.next_entry().await? {
         let path = entry.path();
-        if path.extension() != Some(OsStr::new("ms-part")) {
+        let is_temporary = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix(TEMP_PREFIX))
+            .and_then(|name| name.strip_suffix(".ms-part"))
+            .is_some_and(|id| Uuid::parse_str(id).is_ok());
+        if !is_temporary {
             continue;
         }
-        let metadata = match entry.metadata().await {
+        let metadata = match tokio::fs::symlink_metadata(&path).await {
             Ok(metadata) if metadata.is_file() => metadata,
             Ok(_) => continue,
             Err(e) => {
@@ -245,24 +373,24 @@ pub async fn cleanup_stale_parts(dir: &Path) -> std::io::Result<usize> {
 
 /// 在 `dir` 下为 `name` 选一个不冲突的路径：已存在则插入 " (1)"、" (2)"…（不覆盖）。
 pub fn unique_path(dir: &Path, name: &str) -> PathBuf {
-    let candidate = dir.join(name);
-    if !candidate.exists() {
-        return candidate;
+    (0..10_000)
+        .map(|index| numbered_path(dir, name, index))
+        .find(|path| !path.exists())
+        // 只供文件名预览，真正落地必须使用 publish_unique 原子创建。
+        .unwrap_or_else(|| dir.join(format!("{}-{name}", Uuid::new_v4())))
+}
+
+fn numbered_path(dir: &Path, name: &str, index: u32) -> PathBuf {
+    if index == 0 {
+        return dir.join(name);
     }
     let path = Path::new(name);
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or(name);
     let ext = path.extension().and_then(|s| s.to_str());
-    for i in 1..10_000 {
-        let candidate_name = match ext {
-            Some(e) => format!("{stem} ({i}).{e}"),
-            None => format!("{stem} ({i})"),
-        };
-        let p = dir.join(candidate_name);
-        if !p.exists() {
-            return p;
-        }
-    }
-    dir.join(name) // 极端情况兜底
+    dir.join(match ext {
+        Some(ext) => format!("{stem} ({index}).{ext}"),
+        None => format!("{stem} ({index})"),
+    })
 }
 
 #[cfg(test)]
@@ -290,6 +418,14 @@ mod tests {
         assert_eq!(sanitize_name(".gitignore"), ".gitignore");
         // emoji 等保留
         assert_eq!(sanitize_name("照片 🌅.jpg"), "照片 🌅.jpg");
+        assert_eq!(sanitize_name("CON.txt"), "_CON.txt");
+        assert_eq!(sanitize_name("com1"), "_com1");
+        assert_eq!(sanitize_name("Lpt9.log"), "_Lpt9.log");
+        assert_eq!(sanitize_name("com10.txt"), "com10.txt");
+        assert_eq!(
+            sanitize_name(".fesilent-transfer-user.ms-part"),
+            "_.fesilent-transfer-user.ms-part"
+        );
     }
 
     #[test]
@@ -315,9 +451,9 @@ mod tests {
 
         let dir = std::env::temp_dir().join(format!("ms-cleanup-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let stale = dir.join("stale.ms-part");
-        let fresh = dir.join("fresh.ms-part");
-        let normal = dir.join("keep.txt");
+        let stale = dir.join(format!("{TEMP_PREFIX}{}.ms-part", Uuid::new_v4()));
+        let fresh = dir.join(format!("{TEMP_PREFIX}{}.ms-part", Uuid::new_v4()));
+        let normal = dir.join("用户文件.ms-part");
         std::fs::write(&stale, b"old").unwrap();
         std::fs::write(&fresh, b"new").unwrap();
         std::fs::write(&normal, b"keep").unwrap();
@@ -325,6 +461,12 @@ mod tests {
         File::options()
             .write(true)
             .open(&stale)
+            .unwrap()
+            .set_times(FileTimes::new().set_modified(old))
+            .unwrap();
+        File::options()
+            .write(true)
+            .open(&normal)
             .unwrap()
             .set_times(FileTimes::new().set_modified(old))
             .unwrap();

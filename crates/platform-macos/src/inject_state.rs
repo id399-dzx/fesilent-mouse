@@ -27,6 +27,10 @@ impl PressTracker {
         }
     }
 
+    pub fn is_key_pressed(&self, key: HidKey) -> bool {
+        self.keys.contains(&key.0)
+    }
+
     pub fn on_button(&mut self, btn: Button, down: bool) -> bool {
         let b = button_code(btn);
         if down {

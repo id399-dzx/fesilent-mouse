@@ -275,7 +275,11 @@ impl Conn {
             .accept_uni()
             .await
             .map_err(|e| NetError::Stream(e.to_string()))?;
-        Ok(MsgRecvStream { inner: s })
+        Ok(MsgRecvStream {
+            inner: s,
+            frame: vec![0; HEADER_LEN],
+            received: 0,
+        })
     }
 
     pub fn close(&self) {
@@ -302,8 +306,11 @@ impl MsgSendStream {
         self.inner
             .finish()
             .map_err(|e| NetError::Stream(e.to_string()))?;
-        self.inner.stopped().await.ok();
-        Ok(())
+        match self.inner.stopped().await {
+            Ok(None) => Ok(()),
+            Ok(Some(code)) => Err(NetError::Stream(format!("对端已停止接收：{code}"))),
+            Err(error) => Err(NetError::Stream(error.to_string())),
+        }
     }
 
     /// 取消：重置流，对端读取将报错（用于文件传输取消，FR-503）。
@@ -315,29 +322,89 @@ impl MsgSendStream {
 /// 接收侧持久流：从一条 QUIC 单向流按帧读消息。
 pub struct MsgRecvStream {
     inner: quinn::RecvStream,
+    frame: Vec<u8>,
+    received: usize,
 }
 
 impl MsgRecvStream {
-    /// 读下一条消息；流正常结束（帧边界）返回 None。
+    /// 可取消地读一帧。半帧状态保存在流对象，select!定时器不会丢掉已消费字节。
+    /// quinn::RecvStream::read本身cancel-safe；read_exact的局部缓冲不具备该保证。
     pub async fn recv(&mut self) -> Result<Option<Msg>> {
-        let mut hdr = [0u8; HEADER_LEN];
-        match self.inner.read_exact(&mut hdr).await {
-            Ok(()) => {}
-            Err(quinn::ReadExactError::FinishedEarly(0)) => return Ok(None),
-            Err(e) => return Err(NetError::Stream(e.to_string())),
+        while self.received < HEADER_LEN {
+            match self
+                .inner
+                .read(&mut self.frame[self.received..HEADER_LEN])
+                .await
+            {
+                Ok(Some(count)) => self.received += count,
+                Ok(None) if self.received == 0 => return Ok(None),
+                Ok(None) => return Err(NetError::Stream("帧头未完成即结束".into())),
+                Err(error) => return Err(NetError::Stream(error.to_string())),
+            }
         }
-        let len = u32::from_le_bytes([hdr[1], hdr[2], hdr[3], hdr[4]]) as usize;
+        let len = u32::from_le_bytes([self.frame[1], self.frame[2], self.frame[3], self.frame[4]])
+            as usize;
         if len > MAX_PAYLOAD {
             return Err(NetError::Stream(format!("帧载荷超限: {len}")));
         }
-        let mut frame = Vec::with_capacity(HEADER_LEN + len);
-        frame.extend_from_slice(&hdr);
-        frame.resize(HEADER_LEN + len, 0);
-        self.inner
-            .read_exact(&mut frame[HEADER_LEN..])
-            .await
-            .map_err(|e| NetError::Stream(e.to_string()))?;
-        let (msg, _) = decode(&frame)?;
-        Ok(Some(msg))
+        self.frame.resize(HEADER_LEN + len, 0);
+        while self.received < self.frame.len() {
+            match self.inner.read(&mut self.frame[self.received..]).await {
+                Ok(Some(count)) => self.received += count,
+                Ok(None) => return Err(NetError::Stream("帧载荷未完成即结束".into())),
+                Err(error) => return Err(NetError::Stream(error.to_string())),
+            }
+        }
+        let (message, _) = decode(&self.frame)?;
+        self.received = 0;
+        self.frame.resize(HEADER_LEN, 0);
+        Ok(Some(message))
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    #[tokio::test]
+    async fn 接收半帧被定时器取消后仍能恢复完整消息() {
+        for split in [2, HEADER_LEN + 1] {
+            let a_id = Identity::generate().unwrap();
+            let b_id = Identity::generate().unwrap();
+            let a = Endpoint::new("127.0.0.1:0".parse().unwrap(), &a_id).unwrap();
+            let b = Endpoint::new("127.0.0.1:0".parse().unwrap(), &b_id).unwrap();
+            let (client, server) = tokio::join!(a.connect(b.local_addr().unwrap()), b.accept());
+            let client = client.unwrap();
+            let server = server.unwrap().unwrap();
+            let message = Msg::from(ms_proto::Ping { seq: 7, t0: 123 });
+            let encoded = encode(&message).unwrap();
+            let mut send = client.open_msg_stream().await.unwrap();
+            send.inner.write_all(&encoded[..split]).await.unwrap();
+            let mut receive = server.accept_msg_stream().await.unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(40), receive.recv())
+                    .await
+                    .is_err()
+            );
+            send.inner.write_all(&encoded[split..]).await.unwrap();
+            let result = tokio::time::timeout(Duration::from_secs(1), receive.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                result,
+                Some(Msg::Ping(ms_proto::Ping { seq: 7, t0: 123 }))
+            ));
+            send.send(&Msg::from(ms_proto::Ping { seq: 8, t0: 456 }))
+                .await
+                .unwrap();
+            assert!(matches!(
+                receive.recv().await.unwrap(),
+                Some(Msg::Ping(ms_proto::Ping { seq: 8, .. }))
+            ));
+            client.close();
+            server.close();
+        }
     }
 }

@@ -166,6 +166,16 @@ pub fn export(explicit_log_dir: Option<&Path>) -> Result<PathBuf, String> {
 mod tests {
     use super::*;
 
+    fn test_directory(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/diag-tests")
+            .join(format!(
+                "{name}-{}-{}",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            ))
+    }
+
     #[test]
     fn utc_parts_已知时间点() {
         assert_eq!(utc_parts(0), (1970, 1, 1, 0, 0, 0));
@@ -192,38 +202,40 @@ mod tests {
     }
 
     #[test]
-    fn assemble_收集日志与配置并写信息文件() {
-        let base = std::env::temp_dir().join(format!("ms-diag-{}", std::process::id()));
+    fn assemble_收集日志与配置并写信息文件() -> std::io::Result<()> {
+        let base = test_directory("collect");
         let _ = std::fs::remove_dir_all(&base);
         let logs = base.join("logs-src");
-        std::fs::create_dir_all(&logs).unwrap();
-        std::fs::write(logs.join("mouseshare.log.2026-07-06"), "log-a").unwrap();
-        std::fs::write(logs.join("mouseshare.log.2026-07-05"), "log-b").unwrap();
+        std::fs::create_dir_all(&logs)?;
+        std::fs::write(logs.join("mouseshare.log.2026-07-06"), "log-a")?;
+        std::fs::write(logs.join("mouseshare.log.2026-07-05"), "log-b")?;
         let cfg = base.join("config.json");
-        std::fs::write(&cfg, "{}").unwrap();
+        std::fs::write(&cfg, "{}")?;
 
         let staging = base.join("out");
-        let n = assemble(&staging, Some(&logs), Some(&cfg), SystemTime::now()).unwrap();
+        let n = assemble(&staging, Some(&logs), Some(&cfg), SystemTime::now())?;
         assert_eq!(n, 3, "2 个日志 + 1 个配置");
         assert!(staging.join("logs/mouseshare.log.2026-07-06").is_file());
         assert!(staging.join("logs/mouseshare.log.2026-07-05").is_file());
         assert!(staging.join("config.json").is_file());
-        let info = std::fs::read_to_string(staging.join("info.txt")).unwrap();
+        let info = std::fs::read_to_string(staging.join("info.txt"))?;
         assert!(
             info.contains(env!("CARGO_PKG_VERSION")),
             "info.txt 应含版本号"
         );
-        let _ = std::fs::remove_dir_all(&base);
+        std::fs::remove_dir_all(&base)?;
+        Ok(())
     }
 
     #[test]
-    fn assemble_无日志目录也能出信息文件() {
-        let base = std::env::temp_dir().join(format!("ms-diag-empty-{}", std::process::id()));
+    fn assemble_无日志目录也能出信息文件() -> std::io::Result<()> {
+        let base = test_directory("empty");
         let _ = std::fs::remove_dir_all(&base);
         let staging = base.join("out");
-        let n = assemble(&staging, None, None, SystemTime::now()).unwrap();
+        let n = assemble(&staging, None, None, SystemTime::now())?;
         assert_eq!(n, 0);
         assert!(staging.join("info.txt").is_file());
-        let _ = std::fs::remove_dir_all(&base);
+        std::fs::remove_dir_all(&base)?;
+        Ok(())
     }
 }

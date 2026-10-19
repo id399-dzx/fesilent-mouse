@@ -20,4 +20,5 @@ iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/icon.icns"
 sed -e "s/@VERSION@/${VERSION}/g" scripts/release-Info.plist.in > "$APP/Contents/Info.plist"
 codesign --force --deep --sign - "$APP"
 codesign --verify --deep --strict "$APP"
+python3 -B scripts/verify-package.py --kind macos --artifact "$APP" --smoke
 echo "已生成 ${APP}（com.fesilent.mouse，版本 ${VERSION}）"

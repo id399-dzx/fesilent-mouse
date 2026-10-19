@@ -12,13 +12,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread::JoinHandle;
 
+use ms_platform::synthetic::is_own_event;
 use ms_platform::{EventSink, InputCapture, InputEvent, PlatformError, Result};
 
 use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, GetCursorPos, GetMessageW, GetSystemMetrics, HHOOK,
-    KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT, PostThreadMessageW, SM_CXSCREEN, SM_CYSCREEN,
+    CallNextHookEx, DispatchMessageW, GetCursorPos, GetMessageW, GetSystemMetrics, KBDLLHOOKSTRUCT,
+    MSG, MSLLHOOKSTRUCT, PM_NOREMOVE, PeekMessageW, PostThreadMessageW, SM_CXSCREEN, SM_CYSCREEN,
     SetCursorPos, SetWindowsHookExW, ShowCursor, TranslateMessage, UnhookWindowsHookEx,
     WH_KEYBOARD_LL, WH_MOUSE_LL, WM_QUIT,
 };
@@ -53,6 +54,11 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
     if code == HC_ACTION {
         // SAFETY: 低级键盘钩子 lparam 指向有效 KBDLLHOOKSTRUCT
         let kb = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
+        if is_own_event(kb.dwExtraInfo as u64) {
+            // 自家注入交给本机 OS，不进入 sink/快捷键，也不能被当前 grab 吞掉。
+            // SAFETY: 仍在系统钩子回调中，原样透传有效参数给后续钩子。
+            return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+        }
         let message = wparam.0 as u32;
         let extended = (kb.flags.0 & LLKHF_EXTENDED) != 0;
         // 修饰键优先用 vkCode（左右区分可靠），其余键用 scanCode+extended
@@ -82,6 +88,10 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
     if code == HC_ACTION {
         // SAFETY: 低级鼠标钩子 lparam 指向有效 MSLLHOOKSTRUCT
         let ms = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
+        if is_own_event(ms.dwExtraInfo as u64) {
+            // SAFETY: 与键盘相同，自家合成移动/按键/滚轮始终透传给系统。
+            return unsafe { CallNextHookEx(None, code, wparam, lparam) };
+        }
         let message = wparam.0 as u32;
         let swallow = CTX.with_borrow_mut(|c| {
             let Some(ctx) = c.as_mut() else {
@@ -221,26 +231,45 @@ impl InputCapture for WinCapture {
                     });
                 });
 
-                // SAFETY: 安装两个低级钩子
-                let kbd = unsafe {
+                // SAFETY: 安装低级键盘钩子，回调与模块句柄均有效。
+                let kbd = match unsafe {
                     SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), Some(hmod), 0)
+                } {
+                    Ok(hook) => hook,
+                    Err(error) => {
+                        CTX.with_borrow_mut(|c| *c = None);
+                        let _ = tx.send(Err(format!("安装键盘钩子失败: {error}")));
+                        return;
+                    }
                 };
-                let mouse =
-                    unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), Some(hmod), 0) };
-                let (kbd, mouse): (HHOOK, HHOOK) = match (kbd, mouse) {
-                    (Ok(k), Ok(m)) => (k, m),
-                    _ => {
-                        let _ = tx.send(Err("SetWindowsHookExW 失败".into()));
+                // SAFETY: 同上；鼠标钩子失败时释放已安装的键盘钩子。
+                let mouse = match unsafe {
+                    SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), Some(hmod), 0)
+                } {
+                    Ok(hook) => hook,
+                    Err(error) => {
+                        // SAFETY: kbd 是本线程刚安装的有效句柄。
+                        unsafe {
+                            let _ = UnhookWindowsHookEx(kbd);
+                        }
+                        CTX.with_borrow_mut(|c| *c = None);
+                        let _ = tx.send(Err(format!("安装鼠标钩子失败: {error}")));
                         return;
                     }
                 };
 
+                // PostThreadMessage 仅能向已有消息队列的线程投递。先强制建队列，
+                // 再发布就绪，避免 start 后立即 stop 丢失 WM_QUIT 并永久 join。
+                let mut msg = MSG::default();
+                // SAFETY: msg 是有效出参；查询消息会创建当前线程的消息队列。
+                unsafe {
+                    let _ = PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE);
+                }
                 tid_slot.store(current_thread_id(), Ordering::Release);
                 let _ = tx.send(Ok(()));
                 tracing::info!(target: "mouseshare::win", "低级钩子已安装");
 
                 // 消息循环（钩子必须有消息循环才会被回调）
-                let mut msg = MSG::default();
                 // SAFETY: 标准消息循环，GetMessageW 返回 0(WM_QUIT)/-1(错误) 时退出
                 unsafe {
                     while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
@@ -255,6 +284,7 @@ impl InputCapture for WinCapture {
                     let _ = UnhookWindowsHookEx(mouse);
                 }
                 CTX.with_borrow_mut(|c| *c = None);
+                tid_slot.store(0, Ordering::Release);
                 tracing::info!(target: "mouseshare::win", "捕获线程退出");
             })
             .map_err(PlatformError::Io)?;
@@ -268,7 +298,10 @@ impl InputCapture for WinCapture {
                 let _ = handle.join();
                 Err(PlatformError::Api(msg))
             }
-            Err(_) => Err(PlatformError::Api("捕获线程未就绪即退出".into())),
+            Err(_) => {
+                let _ = handle.join();
+                Err(PlatformError::Api("捕获线程未就绪即退出".into()))
+            }
         }
     }
 
@@ -282,6 +315,9 @@ impl InputCapture for WinCapture {
     }
 
     fn stop(&mut self) -> Result<()> {
+        // TECH-REVIEW A-1/B-2：兜底恢复先解除 grab；release_all 由上层事务执行。
+        self.grab.store(false, Ordering::Release);
+        let cursor_result = self.confine_cursor(false);
         let tid = self.thread_id.load(Ordering::Acquire);
         if tid != 0 {
             // SAFETY: 向捕获线程投递 WM_QUIT 结束其消息循环
@@ -291,6 +327,16 @@ impl InputCapture for WinCapture {
         }
         if let Some(h) = self.thread.take() {
             let _ = h.join();
+        }
+        self.thread_id.store(0, Ordering::Release);
+        cursor_result
+    }
+
+    fn check_health(&self) -> Result<()> {
+        if self.thread.as_ref().is_none_or(JoinHandle::is_finished) {
+            return Err(PlatformError::Api(
+                "Windows 捕获线程未运行（HookLost）".into(),
+            ));
         }
         Ok(())
     }

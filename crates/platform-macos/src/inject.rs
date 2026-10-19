@@ -6,6 +6,7 @@
 
 use std::ffi::c_void;
 
+use ms_platform::synthetic::OWN_EVENT_MARKER;
 use ms_platform::{Button, HidKey, InputInject, PlatformError, Result};
 
 use crate::inject_state::PressTracker;
@@ -49,6 +50,7 @@ const MOUSE_BTN_RIGHT: u32 = 1;
 const MOUSE_BTN_CENTER: u32 = 2;
 // CGEventField
 const FIELD_BUTTON_NUMBER: u32 = 3;
+const FIELD_SOURCE_USER_DATA: u32 = 42; // kCGEventSourceUserData
 // kCGMouseEventClickState：点击计数（1=单击 2=双击 3=三击）。macOS 不会从合成事件
 // 自动识别双击，必须显式设此字段，应用才会触发"双击打开"等行为（TECH-REVIEW B-8）。
 const FIELD_CLICK_STATE: u32 = 1;
@@ -131,6 +133,18 @@ fn hid_modifier_flag(hid: u16) -> Option<u64> {
         0xE2 | 0xE6 => Some(FLAG_ALT),     // L/R Alt(Option)
         0xE3 | 0xE7 => Some(FLAG_CMD),     // L/R GUI(Command)
         _ => None,
+    }
+}
+
+/// 左右修饰键共享 CG flag，但有各自的按下状态；释放其中一个不能清除另一个。
+fn track_key(tracker: &mut PressTracker, flags: &mut u64, key: HidKey, down: bool) {
+    tracker.on_key(key, down);
+    if let Some(mask) = hid_modifier_flag(key.0) {
+        if down || tracker.is_key_pressed(HidKey(key.0 ^ 4)) {
+            *flags |= mask;
+        } else {
+            *flags &= !mask;
+        }
     }
 }
 
@@ -230,6 +244,7 @@ impl MacInject {
             let ev = CGEventCreateKeyboardEvent(self.source, vk, down);
             if !ev.is_null() {
                 CGEventSetFlags(ev, self.mod_flags);
+                CGEventSetIntegerValueField(ev, FIELD_SOURCE_USER_DATA, OWN_EVENT_MARKER as i64);
                 CGEventPost(POST_TAP_HID, ev);
                 CFRelease(ev as CFTypeRef);
             }
@@ -264,6 +279,7 @@ impl MacInject {
                     CGEventSetIntegerValueField(ev, FIELD_DELTA_Y, delta.1);
                 }
                 CGEventSetFlags(ev, self.mod_flags);
+                CGEventSetIntegerValueField(ev, FIELD_SOURCE_USER_DATA, OWN_EVENT_MARKER as i64);
                 CGEventPost(POST_TAP_HID, ev);
                 CFRelease(ev as CFTypeRef);
             }
@@ -310,18 +326,11 @@ impl Drop for MacInject {
 
 impl InputInject for MacInject {
     fn key(&mut self, key: HidKey, down: bool) -> Result<()> {
-        // 先更新修饰键状态，使本次及后续事件携带正确 flags（组合键生效）
-        if let Some(mask) = hid_modifier_flag(key.0) {
-            if down {
-                self.mod_flags |= mask;
-            } else {
-                self.mod_flags &= !mask;
-            }
-        }
         let r = match hid_to_vk(key) {
             Some(vk) => {
+                // 先更新修饰键状态，使本次及后续事件携带正确 flags（组合键生效）。
+                track_key(&mut self.tracker, &mut self.mod_flags, key, down);
                 self.post_key(vk, down);
-                self.tracker.on_key(key, down);
                 Ok(())
             }
             None => {
@@ -431,6 +440,7 @@ impl InputInject for MacInject {
         unsafe {
             let ev = CGEventCreateScrollWheelEvent(self.source, unit, 2, w1, w2);
             if !ev.is_null() {
+                CGEventSetIntegerValueField(ev, FIELD_SOURCE_USER_DATA, OWN_EVENT_MARKER as i64);
                 CGEventPost(POST_TAP_HID, ev);
                 CFRelease(ev as CFTypeRef);
             }
@@ -460,6 +470,7 @@ impl InputInject for MacInject {
             };
             self.post_mouse(etype, pos, cgbtn, num, 0, (0, 0));
         }
+        self.mod_flags = 0;
         self.drag = None;
         Ok(())
     }
@@ -479,6 +490,23 @@ mod tests {
         assert_eq!(hid_modifier_flag(0xE1), Some(FLAG_SHIFT), "LShift");
         assert_eq!(hid_modifier_flag(0x04), None, "字母键非修饰键");
         assert_eq!(hid_modifier_flag(0x29), None, "Esc 非修饰键");
+    }
+
+    #[test]
+    fn 左右修饰键同时按住时释放一个仍保留另一侧状态() {
+        for left in 0xE0..=0xE3 {
+            let mut tracker = PressTracker::new();
+            let mut flags = 0;
+            let mask = hid_modifier_flag(left).unwrap_or(0);
+            track_key(&mut tracker, &mut flags, HidKey(left), true);
+            track_key(&mut tracker, &mut flags, HidKey(left + 4), true);
+            track_key(&mut tracker, &mut flags, HidKey(left), false);
+            assert_eq!(flags, mask, "左侧释放不能取消仍按住的右侧修饰键");
+            track_key(&mut tracker, &mut flags, HidKey(0x04), true);
+            assert_eq!(flags, mask, "后续字母事件必须继续携带修饰态");
+            track_key(&mut tracker, &mut flags, HidKey(left + 4), false);
+            assert_eq!(flags, 0);
+        }
     }
 
     #[test]

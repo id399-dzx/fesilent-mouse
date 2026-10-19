@@ -30,6 +30,10 @@ try {
     Copy-Item -LiteralPath (Join-Path $repoRoot 'target/x86_64-pc-windows-msvc/release/fesilent-mouse.exe') -Destination $binary -Force
     $checksum = (Get-FileHash -LiteralPath $binary -Algorithm SHA256).Hash.ToLowerInvariant()
     "$checksum  fesilent-mouse.exe" | Set-Content -LiteralPath (Join-Path $outputDirectory 'SHA256SUMS') -Encoding ascii
+    python -B scripts/verify-package.py --kind windows --artifact $binary --checksums (Join-Path $outputDirectory 'SHA256SUMS') --smoke
+    if ($LASTEXITCODE -ne 0) {
+        throw "Windows 包验证失败（verify-package exit code: $LASTEXITCODE）"
+    }
     Write-Output "已生成 $binary"
 }
 finally {

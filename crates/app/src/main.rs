@@ -14,10 +14,12 @@ mod clip;
 mod cliphist;
 mod config;
 mod daemon;
+mod devices;
 mod diag;
 mod logging;
 mod record;
 mod selftest;
+mod session_safety;
 mod status;
 mod transfers;
 mod ui;
@@ -50,6 +52,15 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+
+    // 隔离预览先于所有副作用入口：不初始化文件日志，也不能意外进入自检、录制或 daemon。
+    if ui::ui_preview_enabled() {
+        return if ui::run(args) {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+    }
 
     // 自检模式：不需要日志/平台装配，直接跑并按结果设退出码
     if args.selftest {
@@ -103,7 +114,7 @@ fn main() -> ExitCode {
         };
     }
 
-    // 托盘 UI 模式：托盘 + eframe 设置窗口（图形化启停 + 全部设置）
+    // 托盘 UI 模式：托盘 + egui 设置窗口（图形化启停 + 全部设置）
     if args.tray {
         return if ui::run(args) {
             ExitCode::SUCCESS

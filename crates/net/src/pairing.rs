@@ -74,6 +74,11 @@ impl TrustStore {
         self.fingerprints.len()
     }
 
+    /// 仅用于发现时跳过已知设备；广播ID不能用于授予信任。
+    pub fn contains_discovery_id(&self, id: &str) -> bool {
+        id.len() == 32 && self.fingerprints.iter().any(|fp| fp.starts_with(id))
+    }
+
     /// 序列化为字节（存入 SecureStore）。
     pub fn to_bytes(&self) -> Vec<u8> {
         serde_json::to_vec(self).unwrap_or_default()
