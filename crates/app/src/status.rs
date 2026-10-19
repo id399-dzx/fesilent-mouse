@@ -3,8 +3,8 @@
 //! daemon 后台线程在心跳里写入（已连/RTT/累计断连次数），托盘事件循环每秒读出并
 //! 刷新状态。频繁更新的数值使用原子量，低频错误文案使用 Mutex。
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 /// RTT 未知哨兵（如尚未连上或刚断开）。
 const RTT_UNKNOWN: u32 = u32::MAX;
@@ -63,7 +63,10 @@ impl ConnStatus {
 
     /// 可直接显示的错误提示；daemon 只写不含路径、证书或原始输入的帮助文案。
     pub fn last_error(&self) -> Option<String> {
-        self.last_error.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.last_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     pub fn clear_error(&self) {
@@ -136,7 +139,11 @@ mod tests {
         s.set_connected(true);
         s.set_rtt_ms(12);
         let writer = std::sync::Arc::clone(&s);
-        assert!(std::thread::spawn(move || writer.set_error("请在 Mac 端启用互控")).join().is_ok());
+        assert!(
+            std::thread::spawn(move || writer.set_error("请在 Mac 端启用互控"))
+                .join()
+                .is_ok()
+        );
         assert!(!s.connected());
         assert_eq!(s.rtt_ms(), None);
         assert_eq!(s.last_error().as_deref(), Some("请在 Mac 端启用互控"));

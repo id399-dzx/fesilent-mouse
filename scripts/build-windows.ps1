@@ -9,7 +9,11 @@ Push-Location -LiteralPath $repoRoot
 try {
     # 静态链接 MSVC 运行库，便携版无需单独附带 VC Runtime DLL。
     $previousRustFlags = $env:RUSTFLAGS
-    $env:RUSTFLAGS = "$previousRustFlags -C target-feature=+crt-static".Trim()
+    $env:RUSTFLAGS = if ($previousRustFlags -match 'target-feature=\+crt-static') {
+        $previousRustFlags
+    } else {
+        "$previousRustFlags -C target-feature=+crt-static".Trim()
+    }
     try {
         cargo build --release -p ms-app --target x86_64-pc-windows-msvc --locked
         if ($LASTEXITCODE -ne 0) {

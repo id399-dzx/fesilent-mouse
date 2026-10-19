@@ -2,7 +2,7 @@
 //!
 //! 顶层带 `config_ver`，所有字段 serde default，保证旧配置可读、新增字段不破坏。
 //! 路径：mac `~/Library/Application Support/FesilentMouse/config.json`，
-//! Windows `%APPDATA%\MouseShare\config.json`。
+//! Windows `%APPDATA%\FesilentMouse\config.json`。
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -22,7 +22,9 @@ pub(crate) fn normalize_peer_address(input: &str) -> Result<Option<String>, Stri
     }
     if let Ok(addr) = input.parse::<SocketAddr>() {
         if addr.is_ipv6() {
-            return Err("请使用局域网 IPv4 地址，例如 192.168.3.188。当前连接服务暂不支持 IPv6。".into());
+            return Err(
+                "请使用局域网 IPv4 地址，例如 192.168.1.20。当前连接服务暂不支持 IPv6。".into(),
+            );
         }
         if addr.port() == 0 {
             return Err("对端端口必须为 1–65535，默认端口是 53728。".into());
@@ -31,11 +33,13 @@ pub(crate) fn normalize_peer_address(input: &str) -> Result<Option<String>, Stri
     }
     if let Ok(ip) = input.parse::<IpAddr>() {
         if ip.is_ipv6() {
-            return Err("请使用局域网 IPv4 地址，例如 192.168.3.188。当前连接服务暂不支持 IPv6。".into());
+            return Err(
+                "请使用局域网 IPv4 地址，例如 192.168.1.20。当前连接服务暂不支持 IPv6。".into(),
+            );
         }
         return Ok(Some(SocketAddr::new(ip, DEFAULT_PEER_PORT).to_string()));
     }
-    Err("请使用有效的局域网 IPv4 地址，例如 192.168.3.188 或 192.168.3.188:53728。Mac 端可留空并启用互控。".into())
+    Err("请使用有效的局域网 IPv4 地址，例如 192.168.1.20 或 192.168.1.20:53728。Mac 端可留空并启用互控。".into())
 }
 
 fn default_config_ver() -> u32 {
@@ -91,7 +95,7 @@ pub struct Config {
     /// 交换 Ctrl↔Cmd（默认开）。
     #[serde(default = "default_true")]
     pub swap_modifiers: bool,
-    /// 打开软件即自动开始互控（用户首次手动启用后置 true，之后免手动）。
+    /// 打开软件即自动开始互控，由设置中的复选框决定。
     #[serde(default)]
     pub auto_start: bool,
     /// 剪贴板同步开关（FR-404，默认开）。
@@ -276,7 +280,10 @@ mod tests {
     fn 对端地址留空启用自动发现() {
         for input in ["", "   ", "\t\r\n"] {
             assert_eq!(normalize_peer_address(input).unwrap(), None);
-            let cfg = Config { connect: Some(input.into()), ..Config::default() };
+            let cfg = Config {
+                connect: Some(input.into()),
+                ..Config::default()
+            };
             let args = cfg.to_args(None);
             assert!(args.serve);
             assert_eq!(args.connect, None);
@@ -286,18 +293,30 @@ mod tests {
     #[test]
     fn 裸ipv4补默认端口() {
         for (input, expected) in [
-            (" 192.168.3.188 ", "192.168.3.188:53728"),
+            (" 192.168.1.20 ", "192.168.1.20:53728"),
             ("127.0.0.1", "127.0.0.1:53728"),
         ] {
-            assert_eq!(normalize_peer_address(input).unwrap().as_deref(), Some(expected));
-            let cfg = Config { connect: Some(input.into()), ..Config::default() };
+            assert_eq!(
+                normalize_peer_address(input).unwrap().as_deref(),
+                Some(expected)
+            );
+            let cfg = Config {
+                connect: Some(input.into()),
+                ..Config::default()
+            };
             assert_eq!(cfg.to_args(None).connect.as_deref(), Some(expected));
         }
     }
 
     #[test]
     fn ipv6提示使用局域网ipv4而非接受无法连接的地址() {
-        for input in ["::1", "2001:db8::123", "[::1]:53728", "[2001:db8::1]:65535", "[::1]:0"] {
+        for input in [
+            "::1",
+            "2001:db8::123",
+            "[::1]:53728",
+            "[2001:db8::1]:65535",
+            "[::1]:0",
+        ] {
             let error = normalize_peer_address(input).unwrap_err();
             assert!(error.contains("请使用局域网 IPv4 地址"), "{input}: {error}");
         }
@@ -305,19 +324,34 @@ mod tests {
 
     #[test]
     fn 显式有效端口保留且拒绝非法地址() {
-        for input in ["127.0.0.1:1", "192.168.3.188:65535"] {
-            assert_eq!(normalize_peer_address(input).unwrap().as_deref(), Some(input));
+        for input in ["127.0.0.1:1", "192.168.1.20:65535"] {
+            assert_eq!(
+                normalize_peer_address(input).unwrap().as_deref(),
+                Some(input)
+            );
         }
         for input in [
-            "127.0.0.1:0", "[::1]:0", "127.0.0.1:65536", "127.0.0.1:-1",
-            "127.0.0.1:", "999.1.1.1", "localhost:53728", "https://192.168.3.188",
-            "[::1]", "[::1]:abc", "192.168.3.188:53728:1", "private pasted text",
+            "127.0.0.1:0",
+            "[::1]:0",
+            "127.0.0.1:65536",
+            "127.0.0.1:-1",
+            "127.0.0.1:",
+            "999.1.1.1",
+            "localhost:53728",
+            "https://192.168.1.20",
+            "[::1]",
+            "[::1]:abc",
+            "192.168.1.20:53728:1",
+            "private pasted text",
         ] {
             assert!(normalize_peer_address(input).is_err(), "应拒绝 {input}");
         }
         let error = normalize_peer_address("private pasted text").unwrap_err();
         assert!(!error.contains("private pasted text"));
-        let cfg = Config { connect: Some("invalid".into()), ..Config::default() };
+        let cfg = Config {
+            connect: Some("invalid".into()),
+            ..Config::default()
+        };
         let args = cfg.to_args(None);
         assert!(!args.serve, "非法地址不能静默变成监听模式");
         assert_eq!(args.connect.as_deref(), Some("invalid"));

@@ -24,6 +24,7 @@ use crate::cli::Args;
 use crate::clip;
 use crate::config::{Config, DEFAULT_PEER_PORT, normalize_peer_address};
 use crate::status::ConnStatus;
+use crate::transfers;
 use crate::xfer;
 
 /// 引擎相关的「可实时调整」设置（设置界面改动后无需重启互控即生效）。
@@ -163,10 +164,11 @@ pub fn run_until(
             return false;
         }
     };
-    finish_run(
-        rt.block_on(run_async(&args, &config, running, Arc::clone(&status))),
-        &status,
-    )
+    let result = rt.block_on(run_async(&args, &config, running, Arc::clone(&status)));
+    // 先停止运行时中的后台传输任务，随后统一写取消终态，避免任务被 drop 后留下永久进度。
+    drop(rt);
+    transfers::center().cancel_active();
+    finish_run(result, &status)
 }
 
 /// 所有异步退出路径共用的状态收尾，包括重连退避期间的提前暂停。
@@ -179,7 +181,9 @@ fn finish_run(result: Result<(), String>, status: &ConnStatus) -> bool {
         }
         Err(e) => {
             if status.last_error().is_none() {
-                status.set_error("连接服务启动失败，请退出软件后重新打开，并确认 Mac 已授予辅助功能权限。");
+                status.set_error(
+                    "连接服务启动失败，请退出软件后重新打开，并确认 Mac 已授予辅助功能权限。",
+                );
             }
             tracing::error!(target: "mouseshare::app", error = %e, "守护进程退出");
             false
@@ -342,6 +346,8 @@ async fn run_async(
             }
             Ok(()) => {}
         }
+        // 网络会话结束后旧传输不应跟随下一次连接继续等待确认。
+        transfers::center().cancel_active();
         status.set_connected(false);
         if running.load(Ordering::Acquire) {
             tracing::warn!(target: "mouseshare::app", "连接断开，自动重连中");
@@ -862,7 +868,10 @@ mod tests {
 
         status.set_error("请在 Mac 端授予辅助功能权限");
         assert!(!finish_run(Err("internal detail".into()), &status));
-        assert_eq!(status.last_error().as_deref(), Some("请在 Mac 端授予辅助功能权限"));
+        assert_eq!(
+            status.last_error().as_deref(),
+            Some("请在 Mac 端授予辅助功能权限")
+        );
 
         status.clear_error();
         assert!(!finish_run(Err("internal detail".into()), &status));

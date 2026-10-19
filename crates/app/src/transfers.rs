@@ -137,50 +137,13 @@ pub struct Handle {
 impl Handle {
     /// 更新已传字节数（同时推进速率估算，T-809）。
     pub fn update(&self, transferred: u64) {
-        let now = Instant::now();
-        center().with(|list| {
-            if let Some(e) = list.iter_mut().find(|e| e.id == self.id) {
-                e.transferred = transferred;
-                e.rate.advance(now, transferred);
-            }
-        });
+        center().update(self.id, transferred);
     }
 
     /// 置为某结束/活动相位。转入终态时落一条历史记录（T-809）；
     /// 大文件确认后转 Active 时重置速率计时（确认等待不计入耗时/速率）。
     pub fn set_phase(&self, p: Phase) {
-        let now = Instant::now();
-        let hist = center().with(|list| {
-            let e = list.iter_mut().find(|e| e.id == self.id)?;
-            if e.phase == p {
-                return None;
-            }
-            let prev = e.phase;
-            e.phase = p;
-            match p {
-                Phase::Active => {
-                    if prev == Phase::Confirm {
-                        e.rate = RateState::new(now);
-                    }
-                    None
-                }
-                Phase::Done | Phase::Failed | Phase::Cancelled => Some(HistoryItem {
-                    name: e.name.clone(),
-                    dir: e.dir,
-                    bytes: if p == Phase::Done {
-                        e.total
-                    } else {
-                        e.transferred
-                    },
-                    outcome: p,
-                    secs: now.duration_since(e.rate.started).as_secs(),
-                }),
-                Phase::Confirm => None,
-            }
-        });
-        if let Some(h) = hist {
-            center().push_history(h);
-        }
+        center().set_phase(self.id, p);
     }
 
     /// 用户是否已请求取消。
@@ -220,12 +183,7 @@ pub struct TransferCenter {
     history: Mutex<Vec<HistoryItem>>,
 }
 
-static CENTER: LazyLock<TransferCenter> = LazyLock::new(|| TransferCenter {
-    list: Mutex::new(Vec::new()),
-    next_id: AtomicU64::new(1),
-    show_request: AtomicBool::new(false),
-    history: Mutex::new(Vec::new()),
-});
+static CENTER: LazyLock<TransferCenter> = LazyLock::new(TransferCenter::new);
 
 /// 进程级传输中心单例。
 pub fn center() -> &'static TransferCenter {
@@ -233,9 +191,60 @@ pub fn center() -> &'static TransferCenter {
 }
 
 impl TransferCenter {
+    fn new() -> Self {
+        Self {
+            list: Mutex::new(Vec::new()),
+            next_id: AtomicU64::new(1),
+            show_request: AtomicBool::new(false),
+            history: Mutex::new(Vec::new()),
+        }
+    }
+
     fn with<R>(&self, f: impl FnOnce(&mut Vec<Entry>) -> R) -> R {
         let mut g = self.list.lock().unwrap_or_else(|e| e.into_inner());
         f(&mut g)
+    }
+
+    fn update(&self, id: u64, transferred: u64) {
+        let now = Instant::now();
+        self.with(|list| {
+            if let Some(e) = list.iter_mut().find(|e| e.id == id)
+                && matches!(e.phase, Phase::Active | Phase::Confirm)
+            {
+                e.transferred = transferred;
+                e.rate.advance(now, transferred);
+            }
+        });
+    }
+
+    fn set_phase(&self, id: u64, phase: Phase) {
+        let history = self.with(|list| {
+            let entry = list.iter_mut().find(|entry| entry.id == id)?;
+            transition(entry, phase, Instant::now())
+        });
+        if let Some(history) = history {
+            self.push_history(history);
+        }
+    }
+
+    /// 会话结束时收尾所有未完成项；任务被运行时取消后，UI 仍能看到正确终态。
+    /// 与正常任务完成共用相位迁移，迟到的进度或结果不能复活条目、重复写历史。
+    pub fn cancel_active(&self) {
+        let now = Instant::now();
+        let histories = self.with(|list| {
+            self.show_request.store(false, Ordering::Release);
+            list.iter_mut().filter_map(|entry| {
+                if !matches!(entry.phase, Phase::Active | Phase::Confirm) {
+                    return None;
+                }
+                entry.cancel.store(true, Ordering::Release);
+                entry.decision.store(DECISION_REJECT, Ordering::Release);
+                transition(entry, Phase::Cancelled, now)
+            }).collect::<Vec<_>>()
+        });
+        for history in histories {
+            self.push_history(history);
+        }
     }
 
     /// 登记一条新传输。`Send` 且 `total > 阈值` 时初始相位为 `Confirm` 并请求弹窗。
@@ -326,7 +335,9 @@ impl TransferCenter {
     /// UI：对待确认的大文件作出决定（true=确认发送，false=拒绝）。
     pub fn decide(&self, id: u64, approve: bool) {
         self.with(|list| {
-            if let Some(e) = list.iter_mut().find(|e| e.id == id) {
+            if let Some(e) = list.iter_mut().find(|e| e.id == id)
+                && e.phase == Phase::Confirm
+            {
                 e.decision.store(
                     if approve {
                         DECISION_APPROVE
@@ -353,6 +364,31 @@ impl TransferCenter {
     }
 }
 
+/// 终态不可逆；无论是任务自行结束还是会话统一取消，每条传输只产生一次历史。
+fn transition(entry: &mut Entry, phase: Phase, now: Instant) -> Option<HistoryItem> {
+    if entry.phase == phase || matches!(entry.phase, Phase::Done | Phase::Failed | Phase::Cancelled) {
+        return None;
+    }
+    let previous = entry.phase;
+    entry.phase = phase;
+    match phase {
+        Phase::Active => {
+            if previous == Phase::Confirm {
+                entry.rate = RateState::new(now);
+            }
+            None
+        }
+        Phase::Done | Phase::Failed | Phase::Cancelled => Some(HistoryItem {
+            name: entry.name.clone(),
+            dir: entry.dir,
+            bytes: if phase == Phase::Done { entry.total } else { entry.transferred },
+            outcome: phase,
+            secs: now.duration_since(entry.rate.started).as_secs(),
+        }),
+        Phase::Confirm => None,
+    }
+}
+
 /// 已结束（Done/Failed/Cancelled）的条目超过保留上限时，丢弃最旧的若干。
 fn prune_finished(list: &mut Vec<Entry>) {
     let finished = |p: Phase| matches!(p, Phase::Done | Phase::Failed | Phase::Cancelled);
@@ -375,11 +411,10 @@ fn prune_finished(list: &mut Vec<Entry>) {
 mod tests {
     use super::*;
 
-    // 单测合一：transfers 用进程级单例 CENTER，分多个 #[test] 并行会互相干扰
-    // （尤其全局 show_request），故顺序写在一个测试里，按各自 id 断言、不依赖列表全集。
+    // 每个测试使用独立中心，不与并行测试或 daemon 测试共享进程级 CENTER。
     #[test]
     fn 传输中心_确认进度取消() {
-        let c = center();
+        let c = TransferCenter::new();
 
         // 大文件发送 → Confirm + 请求弹窗；小文件 → 直接 Active；接收端不弹确认
         let big = c.begin("big.bin".into(), LARGE_FILE_THRESHOLD + 1, Dir::Send);
@@ -401,7 +436,7 @@ mod tests {
         assert_eq!(phase(recv_big.id), Phase::Active, "接收端不弹确认");
 
         // 进度更新可读
-        big.update(500);
+        c.update(big.id, 500);
         assert_eq!(
             c.snapshot()
                 .iter()
@@ -445,14 +480,14 @@ mod tests {
 
     #[test]
     fn 历史记录_终态落账新在前且封顶() {
-        let c = center();
+        let c = TransferCenter::new();
         let a = c.begin("hist-a.bin".into(), 2048, Dir::Recv);
-        a.update(2048);
-        a.set_phase(Phase::Done);
+        c.update(a.id, 2048);
+        c.set_phase(a.id, Phase::Done);
         let b = c.begin("hist-b.bin".into(), 4096, Dir::Send);
-        b.update(1024);
-        b.set_phase(Phase::Cancelled);
-        b.set_phase(Phase::Cancelled); // 重复置同一终态不重复落账
+        c.update(b.id, 1024);
+        c.set_phase(b.id, Phase::Cancelled);
+        c.set_phase(b.id, Phase::Cancelled); // 重复置同一终态不重复落账
 
         let h = c.history();
         let ia = h.iter().position(|x| x.name == "hist-a.bin").unwrap();
@@ -471,8 +506,49 @@ mod tests {
         // 封顶：塞满后不超过 MAX_HISTORY
         for i in 0..MAX_HISTORY + 2 {
             let t = c.begin(format!("hist-cap-{i}.bin"), 1, Dir::Recv);
-            t.set_phase(Phase::Failed);
+            c.set_phase(t.id, Phase::Failed);
         }
         assert!(c.history().len() <= MAX_HISTORY);
+    }
+
+    #[test]
+    fn 会话退出取消活动与待确认传输且保留已完成历史() {
+        let c = TransferCenter::new();
+        let pending = c.begin("pending.bin".into(), LARGE_FILE_THRESHOLD + 1, Dir::Send);
+        let active = c.begin("active.bin".into(), 4096, Dir::Recv);
+        c.update(active.id, 1234);
+        let done = c.begin("done.bin".into(), 100, Dir::Send);
+        c.update(done.id, 100);
+        c.set_phase(done.id, Phase::Done);
+        assert!(c.has_active());
+
+        c.cancel_active();
+        assert!(!c.has_active());
+        assert!(!c.take_show_request());
+        assert!(pending.is_cancelled());
+        assert!(active.is_cancelled());
+        assert!(!done.is_cancelled(), "已完成任务不应被取消");
+        assert_eq!(pending.decision.load(Ordering::Acquire), DECISION_REJECT);
+        let views = c.snapshot();
+        assert_eq!(views.iter().find(|v| v.id == pending.id).unwrap().phase, Phase::Cancelled);
+        assert_eq!(views.iter().find(|v| v.id == active.id).unwrap().phase, Phase::Cancelled);
+        assert_eq!(views.iter().find(|v| v.id == done.id).unwrap().phase, Phase::Done);
+        let history = c.history();
+        assert_eq!(history.len(), 3);
+        assert_eq!(history.iter().find(|item| item.name == "active.bin").unwrap().bytes, 1234);
+        assert_eq!(history.iter().find(|item| item.name == "done.bin").unwrap().outcome, Phase::Done);
+
+        // 模拟正在结束的后台任务返回迟到成功/失败，以及陈旧的确认按钮事件。
+        c.cancel_active();
+        c.set_phase(active.id, Phase::Done);
+        c.set_phase(active.id, Phase::Failed);
+        c.set_phase(pending.id, Phase::Active);
+        c.set_phase(done.id, Phase::Cancelled);
+        c.update(active.id, 4096);
+        c.decide(pending.id, true);
+        assert!(!c.has_active());
+        assert_eq!(pending.decision.load(Ordering::Acquire), DECISION_REJECT);
+        assert_eq!(c.history().len(), 3, "终态不可逆且历史不重复落账");
+        assert_eq!(c.snapshot().iter().find(|v| v.id == active.id).unwrap().transferred, 1234);
     }
 }

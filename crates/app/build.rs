@@ -47,7 +47,10 @@ fn main() {
              MSVC 构建请使用已安装 Windows SDK 的 Visual Studio 开发者终端。"
         ),
     };
-    assert!(status.success(), "{compiler_name} 编译 Windows 图标资源失败");
+    assert!(
+        status.success(),
+        "{compiler_name} 编译 Windows 图标资源失败"
+    );
 
     println!("cargo:rustc-link-arg-bin=fesilent-mouse={}", out.display());
 }

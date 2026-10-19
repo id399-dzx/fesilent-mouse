@@ -526,7 +526,6 @@ impl App {
         self.egui_glow = Some(egui_glow);
         self.gl_window = Some(gl_window);
     }
-
 }
 
 impl ApplicationHandler<UserEvent> for App {
@@ -577,8 +576,8 @@ impl ApplicationHandler<UserEvent> for App {
             }
         };
 
-        let show_window = self.first_run
-            || std::env::var("FESILENT_SHOW_WINDOW").is_ok_and(|value| value == "1");
+        let show_window =
+            self.first_run || std::env::var("FESILENT_SHOW_WINDOW").is_ok_and(|value| value == "1");
         if show_window {
             gl_window.window().set_visible(true);
         }

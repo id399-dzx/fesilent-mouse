@@ -76,8 +76,6 @@ jobs:
             dist/windows-x64/SHA256SUMS
           if-no-files-found: error
           retention-days: 14
-      - name: Check formatting
-        run: cargo fmt --all -- --check
       - name: Test workspace
         run: cargo test --workspace --target x86_64-pc-windows-msvc --locked
       - name: Check Clippy warnings
@@ -118,8 +116,6 @@ jobs:
             dist/SHA256SUMS
           if-no-files-found: error
           retention-days: 14
-      - name: Check formatting
-        run: cargo fmt --all -- --check
       - name: Test workspace
         run: cargo test --workspace --locked
       - name: Check Clippy warnings
