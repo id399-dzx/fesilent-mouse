@@ -28,7 +28,7 @@ mod imp {
     /// Run 子键路径。
     const RUN_SUBKEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
     /// 值名（与产品名一致）。
-    const VALUE_NAME: PCWSTR = w!("MouseShare");
+    const VALUE_NAME: PCWSTR = w!("FesilentMouse");
 
     pub struct WinAutostart {
         program: PathBuf,

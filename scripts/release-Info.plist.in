@@ -2,10 +2,10 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>CFBundleName</key><string>MouseShare</string>
-  <key>CFBundleDisplayName</key><string>MouseShare</string>
-  <key>CFBundleExecutable</key><string>mouseshare</string>
-  <key>CFBundleIdentifier</key><string>com.mouseshare.app</string>
+  <key>CFBundleName</key><string>Fesilent Mouse</string>
+  <key>CFBundleDisplayName</key><string>Fesilent Mouse</string>
+  <key>CFBundleExecutable</key><string>fesilent-mouse</string>
+  <key>CFBundleIdentifier</key><string>com.fesilent.mouse</string>
   <key>CFBundleVersion</key><string>@VERSION@</string>
   <key>CFBundleShortVersionString</key><string>@VERSION@</string>
   <key>CFBundlePackageType</key><string>APPL</string>

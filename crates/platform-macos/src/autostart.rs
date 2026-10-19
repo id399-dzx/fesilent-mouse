@@ -13,7 +13,7 @@ use std::process::Command;
 use ms_platform::{Autostart, PlatformError, Result};
 
 /// LaunchAgent 的 Label（与 bundle id 一致，SPEC §4）。
-const LABEL: &str = "com.mouseshare.app";
+const LABEL: &str = "com.fesilent.mouse";
 
 pub struct MacAutostart {
     /// 目标 plist 路径（`~/Library/LaunchAgents/<LABEL>.plist`）。

@@ -11,11 +11,11 @@ use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberI
 pub fn default_log_dir() -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     {
-        std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Logs/MouseShare"))
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Logs/FesilentMouse"))
     }
     #[cfg(target_os = "windows")]
     {
-        std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("MouseShare/logs"))
+        std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("FesilentMouse/logs"))
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {

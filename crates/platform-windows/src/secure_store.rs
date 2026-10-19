@@ -23,7 +23,7 @@ impl WinSecureStore {
         let base = std::env::var_os("APPDATA")
             .map(PathBuf::from)
             .ok_or_else(|| PlatformError::Api("APPDATA 环境变量缺失".into()))?;
-        let dir = base.join("MouseShare").join("secure");
+        let dir = base.join("FesilentMouse").join("secure");
         std::fs::create_dir_all(&dir)?;
         Ok(Self { dir })
     }

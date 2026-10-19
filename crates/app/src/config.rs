@@ -1,14 +1,42 @@
 //! 配置持久化（SPEC §4，T-602）：`config.json`。
 //!
 //! 顶层带 `config_ver`，所有字段 serde default，保证旧配置可读、新增字段不破坏。
-//! 路径：mac `~/Library/Application Support/MouseShare/config.json`，
+//! 路径：mac `~/Library/Application Support/FesilentMouse/config.json`，
 //! Windows `%APPDATA%\MouseShare\config.json`。
 
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
 use crate::cli::Args;
+
+pub(crate) const DEFAULT_PEER_PORT: u16 = 53728;
+
+/// 空地址启用自动发现；裸 IPv4 补默认端口，显式端口必须为 1..=65535。
+/// 不把无效输入拼进错误文案，避免把误粘贴的内容显示到日志或界面。
+pub(crate) fn normalize_peer_address(input: &str) -> Result<Option<String>, String> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Ok(None);
+    }
+    if let Ok(addr) = input.parse::<SocketAddr>() {
+        if addr.is_ipv6() {
+            return Err("请使用局域网 IPv4 地址，例如 192.168.3.188。当前连接服务暂不支持 IPv6。".into());
+        }
+        if addr.port() == 0 {
+            return Err("对端端口必须为 1–65535，默认端口是 53728。".into());
+        }
+        return Ok(Some(input.to_string()));
+    }
+    if let Ok(ip) = input.parse::<IpAddr>() {
+        if ip.is_ipv6() {
+            return Err("请使用局域网 IPv4 地址，例如 192.168.3.188。当前连接服务暂不支持 IPv6。".into());
+        }
+        return Ok(Some(SocketAddr::new(ip, DEFAULT_PEER_PORT).to_string()));
+    }
+    Err("请使用有效的局域网 IPv4 地址，例如 192.168.3.188 或 192.168.3.188:53728。Mac 端可留空并启用互控。".into())
+}
 
 fn default_config_ver() -> u32 {
     1
@@ -45,7 +73,7 @@ pub(crate) fn normalize_scroll_speed(value: f64) -> f64 {
 pub struct Config {
     #[serde(default = "default_config_ver")]
     pub config_ver: u32,
-    /// 对端地址 `IP:端口`；为空则本端监听（serve），否则主动连接。
+    /// 对端 IPv4 或 `IPv4:端口`；为空则本端监听（serve），否则主动连接。
     #[serde(default)]
     pub connect: Option<String>,
     /// 对端方位 right/left/top/bottom。
@@ -123,9 +151,14 @@ impl Config {
 
     /// 把配置转成一份 daemon 运行参数；`log_dir` 单独传入（运行时项不进配置）。
     pub fn to_args(&self, log_dir: Option<PathBuf>) -> Args {
+        // 非法值保留到 daemon 启动前统一报错，不能静默退回自动发现。
+        let connect = match normalize_peer_address(self.connect.as_deref().unwrap_or_default()) {
+            Ok(connect) => connect,
+            Err(_) => self.connect.clone(),
+        };
         Args {
-            serve: self.connect.is_none(),
-            connect: self.connect.clone(),
+            serve: connect.is_none(),
+            connect,
             side: self.side.clone(),
             no_takeover: self.no_takeover,
             invert_scroll: self.invert_scroll,
@@ -146,11 +179,11 @@ pub fn config_path() -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     {
         std::env::var_os("HOME")
-            .map(|h| PathBuf::from(h).join("Library/Application Support/MouseShare/config.json"))
+            .map(|h| PathBuf::from(h).join("Library/Application Support/FesilentMouse/config.json"))
     }
     #[cfg(target_os = "windows")]
     {
-        std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("MouseShare\\config.json"))
+        std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("FesilentMouse\\config.json"))
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
@@ -237,5 +270,56 @@ mod tests {
 
         let serve_cfg = Config::default();
         assert!(serve_cfg.to_args(None).serve, "无 connect 应为监听模式");
+    }
+
+    #[test]
+    fn 对端地址留空启用自动发现() {
+        for input in ["", "   ", "\t\r\n"] {
+            assert_eq!(normalize_peer_address(input).unwrap(), None);
+            let cfg = Config { connect: Some(input.into()), ..Config::default() };
+            let args = cfg.to_args(None);
+            assert!(args.serve);
+            assert_eq!(args.connect, None);
+        }
+    }
+
+    #[test]
+    fn 裸ipv4补默认端口() {
+        for (input, expected) in [
+            (" 192.168.3.188 ", "192.168.3.188:53728"),
+            ("127.0.0.1", "127.0.0.1:53728"),
+        ] {
+            assert_eq!(normalize_peer_address(input).unwrap().as_deref(), Some(expected));
+            let cfg = Config { connect: Some(input.into()), ..Config::default() };
+            assert_eq!(cfg.to_args(None).connect.as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn ipv6提示使用局域网ipv4而非接受无法连接的地址() {
+        for input in ["::1", "2001:db8::123", "[::1]:53728", "[2001:db8::1]:65535", "[::1]:0"] {
+            let error = normalize_peer_address(input).unwrap_err();
+            assert!(error.contains("请使用局域网 IPv4 地址"), "{input}: {error}");
+        }
+    }
+
+    #[test]
+    fn 显式有效端口保留且拒绝非法地址() {
+        for input in ["127.0.0.1:1", "192.168.3.188:65535"] {
+            assert_eq!(normalize_peer_address(input).unwrap().as_deref(), Some(input));
+        }
+        for input in [
+            "127.0.0.1:0", "[::1]:0", "127.0.0.1:65536", "127.0.0.1:-1",
+            "127.0.0.1:", "999.1.1.1", "localhost:53728", "https://192.168.3.188",
+            "[::1]", "[::1]:abc", "192.168.3.188:53728:1", "private pasted text",
+        ] {
+            assert!(normalize_peer_address(input).is_err(), "应拒绝 {input}");
+        }
+        let error = normalize_peer_address("private pasted text").unwrap_err();
+        assert!(!error.contains("private pasted text"));
+        let cfg = Config { connect: Some("invalid".into()), ..Config::default() };
+        let args = cfg.to_args(None);
+        assert!(!args.serve, "非法地址不能静默变成监听模式");
+        assert_eq!(args.connect.as_deref(), Some("invalid"));
     }
 }

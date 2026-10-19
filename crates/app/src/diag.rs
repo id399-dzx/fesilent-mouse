@@ -106,7 +106,7 @@ pub fn assemble(
     }
 
     let info = format!(
-        "MouseShare 诊断包\n版本: {}\n系统: {} {}\n导出时间(UTC): {}\n日志目录: {}\n",
+        "Fesilent Mouse 诊断包\n版本: {}\n系统: {} {}\n导出时间(UTC): {}\n日志目录: {}\n",
         env!("CARGO_PKG_VERSION"),
         std::env::consts::OS,
         std::env::consts::ARCH,
@@ -126,7 +126,7 @@ pub fn export(explicit_log_dir: Option<&Path>) -> Result<PathBuf, String> {
     let log_dir = explicit_log_dir
         .map(Path::to_path_buf)
         .or_else(crate::logging::default_log_dir);
-    let name = format!("MouseShare-诊断-{}", stamp(SystemTime::now()));
+    let name = format!("FesilentMouse-诊断-{}", stamp(SystemTime::now()));
     let staging = ms_net::transfer::unique_path(&desktop, &name);
     let n = assemble(
         &staging,

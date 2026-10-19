@@ -1,4 +1,6 @@
-# MouseShare — AI 自主开发守则
+# Fesilent Mouse — AI 自主开发守则
+
+> **本 Fork 的当前上下文（2026-10-19）**：用户明确请求将上游复制到自己的 GitHub，命名为 `fesilent-mouse` 并优化 UI。本次创建 Fork 和推送相关修改在该授权范围内。产品/目录的当前约定见 `docs/FESILENT-UI.md` 与 `NOTICE.md`；上游历史条目保留作参考。Windows 现在同时支持本机 MSVC/Windows SDK 和 macOS 上的 GNU/Zig 交叉构建，旧的 GNU-only 约束不适用于本 Fork 的原生 Windows CI。发布新 Release 等后续请求另按实际用户授权处理，不从旧会话的授权推断。开发产物仍保留在项目目录，日志使用 `--log-dir ./logs`。
 
 > 本文件是 AI（Claude Code 等）进入本项目的**第一入口**。人类只负责权限确认与少量物理操作，
 > 其余开发工作由 AI 按本守则自主完成。

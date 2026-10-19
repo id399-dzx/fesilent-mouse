@@ -9,7 +9,7 @@ use security_framework::passwords::{
 };
 
 /// Keychain service 名（SPEC §4：com.mouseshare.app）。
-const SERVICE: &str = "com.mouseshare.app";
+const SERVICE: &str = "com.fesilent.mouse";
 
 pub struct MacSecureStore;
 

@@ -35,8 +35,10 @@ use crate::diag;
 use crate::status::ConnStatus;
 use crate::transfers::{self, Dir, Phase};
 
+mod views;
+
 /// 方位九宫格的单元尺寸（T-606）。
-const SIDE_CELL: [f32; 2] = [40.0, 24.0];
+const SIDE_CELL: [f32; 2] = [64.0, 36.0];
 
 /// 九宫格空位（占位对齐用）。
 fn blank_cell(ui: &mut egui::Ui) {
@@ -76,8 +78,9 @@ impl GlutinWindowContext {
     unsafe fn new(event_loop: &ActiveEventLoop) -> Self {
         let mut win_attrs = Window::default_attributes()
             .with_resizable(true)
-            .with_inner_size(winit::dpi::LogicalSize::new(460.0, 560.0))
-            .with_title("MouseShare 设置")
+            .with_inner_size(winit::dpi::LogicalSize::new(920.0, 740.0))
+            .with_min_inner_size(winit::dpi::LogicalSize::new(680.0, 560.0))
+            .with_title("Fesilent Mouse")
             .with_visible(false);
         // 自测用：MS_UI_POS="x,y" 指定窗口位置（避开遮挡好截图）；发布无此 env 不生效
         if let Some(p) = std::env::var_os("MS_UI_POS").and_then(|s| s.into_string().ok()) {
@@ -210,16 +213,33 @@ impl DaemonHandle {
         if self.is_running() {
             return;
         }
-        let Ok(cfg) = self.config.lock().map(|c| c.clone()) else {
+        let Ok(mut cfg) = self.config.lock().map(|c| c.clone()) else {
             return;
         };
+        match config::normalize_peer_address(cfg.connect.as_deref().unwrap_or_default()) {
+            Ok(address) => cfg.connect = address,
+            Err(error) => {
+                self.status.set_error(error);
+                return;
+            }
+        }
+        self.status.clear_error();
         let args = cfg.to_args(self.log_dir.clone());
         let running = Arc::new(AtomicBool::new(true));
         self.running = Arc::clone(&running);
         let status = Arc::clone(&self.status);
         // 把共享配置交给 daemon：设置界面改动后引擎设置即时生效（无需重启互控）。
         let config = Arc::clone(&self.config);
+        let previous = self.thread.take();
         self.thread = Some(std::thread::spawn(move || {
+            // 重新应用地址时等待旧监听退出，避免新旧线程同时绑定同一端口。
+            // join 发生在工作线程上，原生窗口仍可继续交互。
+            if let Some(previous) = previous {
+                let _ = previous.join();
+            }
+            if !running.load(Ordering::Acquire) {
+                return;
+            }
             tracing::info!(target: "mouseshare::ui", "互控已启用（后台线程）");
             daemon::run_until(&args, config, Arc::clone(&running), status);
             running.store(false, Ordering::Release);
@@ -229,11 +249,7 @@ impl DaemonHandle {
 
     fn stop(&mut self) {
         self.running.store(false, Ordering::Release);
-        if let Some(h) = self.thread.take() {
-            std::thread::spawn(move || {
-                let _ = h.join();
-            });
-        }
+        self.status.set_connected(false);
     }
 }
 
@@ -304,7 +320,7 @@ fn build_tray_menu(running: bool) -> Menu {
     };
     let toggle = MenuItem::with_id("toggle", toggle_label, true, None);
     let settings = MenuItem::with_id("settings", "设置…", true, None);
-    let quit = MenuItem::with_id("quit", "退出 MouseShare", true, None);
+    let quit = MenuItem::with_id("quit", "退出 Fesilent Mouse", true, None);
     let menu = Menu::new();
     let _ = menu.append_items(&[&toggle, &settings, &PredefinedMenuItem::separator(), &quit]);
     menu
@@ -367,6 +383,11 @@ struct App {
     diag_result: Option<String>,
     /// 最近一次剪贴板历史回填的结果提示（T-808）。
     clip_result: Option<String>,
+    section: views::Section,
+    manual_connection: bool,
+    connection_notice: Option<String>,
+    form_error: Option<String>,
+    local_ips: Vec<String>,
 }
 
 impl App {
@@ -377,6 +398,7 @@ impl App {
             let _ = config::save(&cfg);
         }
         let peer_ip = cfg.connect.clone().unwrap_or_default();
+        let manual_connection = !peer_ip.is_empty();
         let config = Arc::new(Mutex::new(cfg));
         let handle = DaemonHandle::new(Arc::clone(&config), args.log_dir.clone());
         // 剪贴板历史容量按配置生效（T-808；0=关闭，改 config.json 后重启生效）
@@ -403,6 +425,11 @@ impl App {
             hide_requested: false,
             diag_result: None,
             clip_result: None,
+            section: views::Section::Connection,
+            manual_connection,
+            connection_notice: None,
+            form_error: None,
+            local_ips: views::local_ipv4_addresses(),
         }
     }
 
@@ -441,11 +468,8 @@ impl App {
                     false
                 } else {
                     self.handle.start();
-                    true
+                    self.handle.is_running()
                 };
-                if running {
-                    self.remember_auto_start();
-                }
                 self.set_toggle_text(running);
             }
             "settings" => {
@@ -477,16 +501,6 @@ impl App {
         }
     }
 
-    /// 用户启用互控后记住意图：之后每次打开软件自动开始互控（任务2）。
-    fn remember_auto_start(&self) {
-        if let Ok(mut cfg) = self.config.lock()
-            && !cfg.auto_start
-        {
-            cfg.auto_start = true;
-            let _ = config::save(&cfg);
-        }
-    }
-
     /// 渲染一帧设置界面。
     fn redraw(&mut self) {
         let (Some(mut egui_glow), Some(gl_window)) = (self.egui_glow.take(), self.gl_window.take())
@@ -498,7 +512,7 @@ impl App {
             use egui_glow::glow::HasContext as _;
             // SAFETY: gl 由 resumed 初始化，当前上下文有效
             unsafe {
-                gl.clear_color(0.12, 0.12, 0.12, 1.0);
+                gl.clear_color(0.953, 0.961, 0.973, 1.0);
                 gl.clear(egui_glow::glow::COLOR_BUFFER_BIT);
             }
         }
@@ -513,358 +527,6 @@ impl App {
         self.gl_window = Some(gl_window);
     }
 
-    fn draw(&mut self, ctx: &egui::Context) {
-        // 托盘文字随状态同步（隐藏时 on_menu 已即时设过，这里覆盖窗口可见时的情况）
-        let running = self.handle.is_running();
-        self.set_toggle_text(running);
-
-        // ⌘W（mac）/ Ctrl+W（Windows）关闭窗口 = 隐藏到托盘，不退出程序（T-607）。
-        // egui 的 Modifiers::COMMAND 在 mac 映射 ⌘、其余平台映射 Ctrl，一处判断覆盖两端。
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::W)) {
-            self.hide_requested = true;
-        }
-
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("MouseShare");
-
-            // 首次使用权限引导（FR-803，H-1）：未授权辅助功能时互控无法工作，显著提示+一键授权。
-            // 每帧查询（UI 200ms 轮询），授权后横幅自动消失。
-            if !daemon::input_permission_granted() {
-                egui::Frame::new()
-                    .fill(egui::Color32::from_rgb(90, 30, 30))
-                    .inner_margin(8)
-                    .corner_radius(6)
-                    .show(ui, |ui| {
-                        ui.colored_label(
-                            egui::Color32::from_rgb(255, 210, 120),
-                            "⚠ 尚未授权「辅助功能」——互控（键鼠穿越）无法工作",
-                        );
-                        ui.small(
-                            "需在 系统设置 → 隐私与安全性 → 辅助功能 勾选 MouseShare。\n\
-                             点下面按钮会把本应用加入列表并打开该页面，勾选后即可使用（无需重启）。",
-                        );
-                        if ui.button("打开系统设置并授权").clicked() {
-                            daemon::open_input_permission_settings();
-                        }
-                    });
-                ui.add_space(6.0);
-            }
-
-            // 启停按钮 + 同行醒目连接状态（T-609）：绿=已连接、琥珀=运行中未连接、灰=未启用
-            ui.horizontal(|ui| {
-                if ui
-                    .button(if running {
-                        "⏸ 暂停互控"
-                    } else {
-                        "▶ 启用互控"
-                    })
-                    .clicked()
-                {
-                    if running {
-                        self.handle.stop();
-                    } else {
-                        self.handle.start();
-                        self.remember_auto_start();
-                    }
-                }
-                let status = self.handle.status_summary();
-                let color = if status.starts_with('●') {
-                    egui::Color32::from_rgb(76, 195, 138)
-                } else if running {
-                    egui::Color32::from_rgb(239, 159, 39)
-                } else {
-                    ui.visuals().weak_text_color()
-                };
-                ui.colored_label(color, egui::RichText::new(status).strong());
-            });
-            ui.separator();
-
-            // 文件传输（FR-503/504）：进度条、取消、大文件确认。
-            let xfers = transfers::center().snapshot();
-            if !xfers.is_empty() {
-                ui.label("文件传输");
-                for t in &xfers {
-                    let arrow = match t.dir {
-                        Dir::Send => "↑发送",
-                        Dir::Recv => "↓接收",
-                    };
-                    match t.phase {
-                        Phase::Confirm => {
-                            ui.colored_label(
-                                egui::Color32::from_rgb(255, 210, 120),
-                                format!("{arrow} {}（{}）大文件，确认发送？", t.name, human_size(t.total)),
-                            );
-                            ui.horizontal(|ui| {
-                                if ui.button("确认发送").clicked() {
-                                    transfers::center().decide(t.id, true);
-                                }
-                                if ui.button("取消").clicked() {
-                                    transfers::center().decide(t.id, false);
-                                }
-                            });
-                        }
-                        Phase::Active => {
-                            ui.horizontal(|ui| {
-                                ui.label(format!("{arrow} {}", t.name));
-                                if ui.button("取消").clicked() {
-                                    transfers::center().cancel(t.id);
-                                }
-                            });
-                            let frac = if t.total > 0 {
-                                (t.transferred as f32 / t.total as f32).clamp(0.0, 1.0)
-                            } else {
-                                0.0
-                            };
-                            // 进度 + 平滑速率 + 剩余时间（T-809）
-                            let mut txt =
-                                format!("{} / {}", human_size(t.transferred), human_size(t.total));
-                            if t.rate_bps > 0.0 {
-                                txt.push_str(&format!(" · {}/s", human_size(t.rate_bps as u64)));
-                                if let Some(eta) = t.eta_secs {
-                                    txt.push_str(&format!(" · 剩余{}", human_secs(eta)));
-                                }
-                            }
-                            ui.add(egui::ProgressBar::new(frac).text(txt));
-                        }
-                        Phase::Done => {
-                            ui.label(format!("✓ {arrow} {} 完成", t.name));
-                        }
-                        Phase::Failed => {
-                            ui.colored_label(
-                                egui::Color32::LIGHT_RED,
-                                format!("✗ {arrow} {} 失败", t.name),
-                            );
-                        }
-                        Phase::Cancelled => {
-                            ui.weak(format!("⊘ {arrow} {} 已取消", t.name));
-                        }
-                    }
-                }
-                ui.separator();
-            }
-
-            // 最近传输历史（T-809）：可折叠，默认收起，新的在前。
-            let hist = transfers::center().history();
-            if !hist.is_empty() {
-                egui::CollapsingHeader::new(format!("最近传输（{}）", hist.len()))
-                    .default_open(false)
-                    .show(ui, |ui| {
-                        for h in &hist {
-                            let arrow = match h.dir {
-                                Dir::Send => "↑",
-                                Dir::Recv => "↓",
-                            };
-                            let mark = match h.outcome {
-                                Phase::Done => "✓",
-                                Phase::Failed => "✗",
-                                _ => "⊘",
-                            };
-                            ui.small(format!(
-                                "{mark} {arrow} {}　{} · {}",
-                                h.name,
-                                human_size(h.bytes),
-                                human_secs(h.secs)
-                            ));
-                        }
-                    });
-                ui.separator();
-            }
-
-            // 剪贴板历史（T-808）：可折叠、默认收起；「回填」写回系统剪贴板。
-            let clips = cliphist::snapshot();
-            if !clips.is_empty() {
-                egui::CollapsingHeader::new(format!("剪贴板历史（{}）", clips.len()))
-                    .default_open(false)
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.small("⇠ 来自对端　⇢ 本机发出　仅存内存，退出即清");
-                            if ui.small_button("清空").clicked() {
-                                cliphist::clear();
-                                self.clip_result = None;
-                            }
-                        });
-                        for e in &clips {
-                            ui.horizontal(|ui| {
-                                match &e.refill {
-                                    Some(content) => {
-                                        if ui.small_button("回填").clicked() {
-                                            self.clip_result =
-                                                Some(match daemon::write_clipboard(content) {
-                                                    Ok(()) => "✓ 已回填到剪贴板".to_string(),
-                                                    Err(err) => format!("✗ 回填失败：{err}"),
-                                                });
-                                        }
-                                    }
-                                    None => {
-                                        ui.weak("过大");
-                                    }
-                                }
-                                let src = if e.from_peer { "⇠" } else { "⇢" };
-                                ui.small(format!("{src} {}", e.preview));
-                            });
-                        }
-                        if let Some(r) = &self.clip_result {
-                            ui.small(r.clone());
-                        }
-                    });
-                ui.separator();
-            }
-
-            // 设置分组卡片（T-606）：每端只显示在本端生效的选项。
-            // 各设置的消费端见 engine.rs——方位/滚轮反转在控制端（发起穿越方，
-            // 用户布局里=Windows）生效，修饰键交换在被控端（注入方=mac）生效。
-            let card = egui::Frame::new()
-                .fill(egui::Color32::from_rgb(40, 40, 40))
-                .inner_margin(10)
-                .corner_radius(8);
-
-            if let Ok(mut cfg) = self.config.lock() {
-                let mut dirty = false;
-
-                card.show(ui, |ui| {
-                    ui.strong("连接");
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        ui.label("对端 IP");
-                        if ui.text_edit_singleline(&mut self.peer_ip).changed() {
-                            let v = self.peer_ip.trim();
-                            cfg.connect = if v.is_empty() {
-                                None
-                            } else {
-                                Some(v.to_string())
-                            };
-                            dirty = true;
-                        }
-                    });
-                    ui.small("留空 = 同网段自动发现（mDNS）；填 IP:端口 手动连接");
-                    if ui
-                        .checkbox(
-                            &mut cfg.auto_start,
-                            "打开软件时自动连接（启用过一次后默认开启）",
-                        )
-                        .changed()
-                    {
-                        dirty = true;
-                    }
-                    if ui.checkbox(&mut self.autostart_on, "开机自启").changed() {
-                        if let Some(mut a) = platform_autostart() {
-                            if a.set_enabled(self.autostart_on).is_err() {
-                                self.autostart_on = !self.autostart_on;
-                            }
-                        } else {
-                            self.autostart_on = false;
-                        }
-                    }
-                });
-                ui.add_space(6.0);
-
-                if cfg!(target_os = "macos") {
-                    card.show(ui, |ui| {
-                        ui.strong("被 Windows 控制");
-                        ui.small("对端键鼠操作本机时生效");
-                        ui.add_space(4.0);
-                        if ui
-                            .checkbox(&mut cfg.swap_modifiers, "交换 Ctrl ↔ Cmd")
-                            .changed()
-                        {
-                            dirty = true;
-                        }
-                        ui.small("Windows 键盘的 Ctrl+C，在本机注入为 ⌘C");
-                    });
-                } else {
-                    card.show(ui, |ui| {
-                        ui.strong("控制 Mac");
-                        ui.small("本机光标穿越到 Mac 时生效");
-                        ui.add_space(4.0);
-                        ui.label("Mac 在本机的哪一边");
-                        ui.add_space(2.0);
-                        ui.vertical_centered(|ui| {
-                            egui::Grid::new("side_grid").spacing([4.0, 4.0]).show(
-                                ui,
-                                |ui| {
-                                    blank_cell(ui);
-                                    side_cell(ui, &mut cfg.side, &mut dirty, "top", "上");
-                                    blank_cell(ui);
-                                    ui.end_row();
-                                    side_cell(ui, &mut cfg.side, &mut dirty, "left", "左");
-                                    ui.add_sized(
-                                        SIDE_CELL,
-                                        egui::Label::new(egui::RichText::new("本机").weak()),
-                                    );
-                                    side_cell(ui, &mut cfg.side, &mut dirty, "right", "右");
-                                    ui.end_row();
-                                    blank_cell(ui);
-                                    side_cell(ui, &mut cfg.side, &mut dirty, "bottom", "下");
-                                    blank_cell(ui);
-                                    ui.end_row();
-                                },
-                            );
-                            let dir = match cfg.side.as_str() {
-                                "left" => "左",
-                                "top" => "上",
-                                "bottom" => "下",
-                                _ => "右",
-                            };
-                            ui.small(format!("光标从{dir}边缘推出即控制 Mac"));
-                        });
-                        ui.add_space(4.0);
-                        cfg.scroll_speed = config::normalize_scroll_speed(cfg.scroll_speed);
-                        ui.label("纵向滚轮速度");
-                        if ui
-                            .add(
-                                egui::Slider::new(&mut cfg.scroll_speed, 1.0..=3.0)
-                                    .step_by(0.1)
-                                    .fixed_decimals(1)
-                                    .suffix("×"),
-                            )
-                            .changed()
-                        {
-                            cfg.scroll_speed = config::normalize_scroll_speed(cfg.scroll_speed);
-                            dirty = true;
-                        }
-                        ui.small("控制 Mac 时生效，1.0× 为原速，仅调整上下滚动");
-                        ui.add_space(4.0);
-                        if ui
-                            .checkbox(&mut cfg.invert_scroll, "反转滚轮方向")
-                            .changed()
-                        {
-                            dirty = true;
-                        }
-                        ui.small("操作 Mac 时，滚轮上下取反");
-                    });
-                }
-                if dirty {
-                    let _ = config::save(&cfg);
-                }
-            }
-
-            // 诊断导出（T-810）：一键打包日志+配置+版本到桌面，回报问题时直接拖走。
-            ui.separator();
-            ui.horizontal(|ui| {
-                if ui.button("导出诊断包").clicked() {
-                    self.diag_result = Some(match diag::export(self.args.log_dir.as_deref()) {
-                        Ok(p) => format!("✓ 已导出：{}", p.display()),
-                        Err(e) => format!("✗ 导出失败：{e}"),
-                    });
-                }
-                ui.small("日志(近7天)+配置+版本 → 桌面");
-            });
-            if let Some(r) = &self.diag_result {
-                ui.small(r.clone());
-            }
-
-            ui.separator();
-            if cfg!(target_os = "macos") {
-                ui.small("方位、滚轮速度与方向请在 Windows 端设置");
-            } else {
-                ui.small("Ctrl/Cmd 交换请在 Mac 端设置");
-            }
-            ui.small("设置即时生效，无需暂停互控。关闭本窗口会缩到托盘继续运行。");
-        });
-
-        // 窗口可见时定期刷新（更新 RTT 状态行）
-        ctx.request_repaint_after(Duration::from_millis(500));
-    }
 }
 
 impl ApplicationHandler<UserEvent> for App {
@@ -885,6 +547,7 @@ impl ApplicationHandler<UserEvent> for App {
         let gl = Arc::new(gl);
         let egui_glow = egui_glow::EguiGlow::new(event_loop, gl.clone(), None, None, true);
         install_cjk_font(&egui_glow.egui_ctx);
+        views::install_theme(&egui_glow.egui_ctx);
 
         // egui 请求重绘 → 经 proxy 转成 UserEvent::Repaint
         let proxy = self.proxy.clone();
@@ -897,7 +560,7 @@ impl ApplicationHandler<UserEvent> for App {
         // 托盘菜单（初始「启用互控」；切换时整体重建，见 set_toggle_text）
         let mut tb = TrayIconBuilder::new()
             .with_menu(Box::new(build_tray_menu(false)))
-            .with_tooltip("MouseShare");
+            .with_tooltip("Fesilent Mouse");
         if let Some(ic) = load_tray_icon() {
             tb = tb.with_icon(ic);
         }
@@ -914,7 +577,9 @@ impl ApplicationHandler<UserEvent> for App {
             }
         };
 
-        if self.first_run {
+        let show_window = self.first_run
+            || std::env::var("FESILENT_SHOW_WINDOW").is_ok_and(|value| value == "1");
+        if show_window {
             gl_window.window().set_visible(true);
         }
 
@@ -931,12 +596,12 @@ impl ApplicationHandler<UserEvent> for App {
             if auto {
                 tracing::info!(target: "mouseshare::ui", "auto_start 已开，自动启动互控");
                 self.handle.start();
-                self.set_toggle_text(true);
+                self.set_toggle_text(self.handle.is_running());
             }
         }
 
         // 首启：主动渲染一帧，确保窗口立即有内容（不等系统重绘事件）
-        if self.first_run {
+        if show_window {
             self.redraw();
         }
     }

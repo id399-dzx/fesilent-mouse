@@ -191,13 +191,13 @@ pub fn sanitize_name(name: &str) -> String {
     }
 }
 
-/// 默认接收目录（SPEC §4：Downloads/MouseShare）。
+/// 默认接收目录（SPEC §4：Downloads/FesilentMouse）。
 pub fn default_receive_dir() -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     let home = std::env::var_os("USERPROFILE").map(PathBuf::from);
     #[cfg(not(target_os = "windows"))]
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    home.map(|h| h.join("Downloads").join("MouseShare"))
+    home.map(|h| h.join("Downloads").join("FesilentMouse"))
 }
 
 /// 删除 `dir` 中最后修改时间超过 8 小时的 `.ms-part` 残留传输文件。

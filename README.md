@@ -1,62 +1,69 @@
-# MouseShare
+# Fesilent Mouse
 
-在 **macOS 和 Windows 之间共享一套键盘鼠标**的局域网工具：鼠标推向屏幕边缘即可穿越到另一台电脑，支持剪贴板同步（文本 / 图片 / HTML）和复制粘贴式文件传输。类似 Synergy / Barrier，但开箱即配、全程 TLS 加密。
+在同一局域网中，用 Windows 的一套键盘鼠标控制 Mac，并共享剪贴板和文件。
 
-> 当前正式版为 **v0.1.2**。仓库包含开源核心源码和可直接使用的发布包；未接线的私有 Pro 实验代码不在公开仓库中。
+基于 [Yujay-Z/MouseShare](https://github.com/Yujay-Z/MouseShare) 的原生 Rust / egui 工具。本 Fork 保留上游核心与作者历史，重新设计设置界面，并改进连接配置体验。来源和权利边界见 [NOTICE.md](NOTICE.md)，上游原说明见 [docs/UPSTREAM-README.md](docs/UPSTREAM-README.md)。
 
-## 下载
+## 0.2.0 的改进
 
-| 平台 | 文件 |
-|---|---|
-| macOS (Apple Silicon / 11.0+) | [MouseShare-macOS.zip](https://github.com/Yujay-Z/MouseShare/releases/latest/download/MouseShare-macOS.zip) |
-| Windows (x64) | [mouseshare.exe](https://github.com/Yujay-Z/MouseShare/releases/latest/download/mouseshare.exe) |
+- 浅色原生设置窗口：清晰的连接状态、设备方位、分页设置及可滚动内容。
+- 手动输入 Mac 的 IPv4 地址时，自动补齐默认端口 `53728`。
+- 地址先校验再应用；运行中应用新地址会重启连接，不再显示“即时生效”却继续使用旧地址。
+- 连接错误显示在界面中，并说明 Mac 端需要留空地址、启用互控。
+- 保留文件传输进度、速率、取消、大文件确认、剪贴板历史和诊断导出。
+- 独立的应用标识、配置、身份与接收目录，避免覆盖原 MouseShare。
+- GitHub Actions 自动构建 Windows x64 和 Apple Silicon macOS，执行格式、Clippy 与工作区测试。
 
-## 安装与首次运行
+## 下载与运行
 
-### macOS
+构建工件位于 [Actions](https://github.com/id399-dzx/fesilent-mouse/actions/workflows/build.yml) 的成功运行页面中。选择与设备对应的 artifact，解压后运行；GitHub 下载 Actions 工件需要登录。正式发布包若有，见 [Releases](https://github.com/id399-dzx/fesilent-mouse/releases)。
 
-1. 解压 zip，把 `MouseShare.app` 拖到「应用程序」（或任意位置）。
-2. 首次打开：**右键点击 app → 打开 → 打开**（应用未经 Apple 公证，直接双击会被 Gatekeeper 拦截）。若仍被拦，去「系统设置 → 隐私与安全性」点「仍要打开」。
-3. 按提示在「系统设置 → 隐私与安全性 → **辅助功能**」中勾选 MouseShare（捕获/注入键鼠必需）。
-4. 程序以**菜单栏托盘图标**运行，点击图标可 启用/暂停互控、打开设置、退出。
+- Windows x64：`fesilent-mouse-Windows-x64` 内的 `fesilent-mouse.exe`，免安装运行。
+- Apple Silicon macOS：`fesilent-mouse-macOS-arm64` 内的 zip，解压得到 `fesilent-mouse.app`。
+- 每个包附有 `SHA256SUMS`。当前包未购买 Windows 签名或 Apple 公证；首次运行可能需要用户手动确认。
 
-### Windows
+## 首次连接
 
-1. 下载 `mouseshare.exe`，放到任意目录，双击运行。
-2. SmartScreen 提示「已保护你的电脑」时：点「**更多信息 → 仍要运行**」（程序未购买签名证书，属正常提示）。
-3. 程序运行在系统托盘（任务栏右下角），无需管理员权限。
+1. 两台电脑连接同一个局域网，并启动软件。
+2. **Mac 端选择自动发现，地址留空，然后启用互控。**在系统设置的“隐私与安全性 → 辅助功能”中手动授予本应用权限。
+3. Windows 端选择自动发现；若无法发现，改为手动连接并填写 **Mac 的局域网 IPv4**，例如 `192.168.1.20` 或 `192.168.1.20:53728`，再应用并启用互控。不要两端都填写手动地址。
+4. 选择 Mac 相对 Windows 屏幕的位置，然后向对应的屏幕边缘继续推鼠标，达到推挤距离后切换控制。
 
-## 配对使用
+文本、图片和 HTML 可跨机复制粘贴。复制文件后切到另一台电脑粘贴，接收目录默认是 `下载/FesilentMouse`。本版本的 Mac 固定为被控端，控制方向是 Windows → Mac。
 
-1. 两台电脑连接**同一局域网**，分别启动 MouseShare 并点托盘「启用互控」。
-2. 双方自动发现后会各自显示 **6 位配对码**，人工核对两端一致后确认，即完成配对（信任关系保存，之后开机自动连接）。
-3. 在托盘「设置」里选择对端相对本机的方位（左/右/上/下），把鼠标**朝那个方向的屏幕边缘持续推挤约 100 像素**即穿越到对面电脑。
+## 设置与数据
 
-## 常用功能
+| 内容 | Windows | macOS |
+| --- | --- | --- |
+| 配置与设备身份 | `%APPDATA%\FesilentMouse\` | `~/Library/Application Support/FesilentMouse/` |
+| 日志 | `%LOCALAPPDATA%\FesilentMouse\logs\` | `~/Library/Logs/FesilentMouse/` |
+| 接收文件 | `~/Downloads/FesilentMouse/` | `~/Downloads/FesilentMouse/` |
 
-- **剪贴板同步**：在 A 机复制，穿越到 B 机直接粘贴（文本 / 图片 / HTML）。
-- **文件传输**：A 机复制文件 → 鼠标穿越到 B 机 → 粘贴，文件落到 `下载/MouseShare`；超过 1GB 会先弹确认。
-- **残留自动清理**：启动文件传输及每次接收前，自动清理超过 8 小时的 `.ms-part` 残留文件。
-- **传输中心**：显示实时速度、预计剩余时间和最近传输记录。
-- **滚轮调节**：Windows 控制 Mac 时可独立设置 `1.0×–3.0×` 纵向滚轮速度。
-- **紧急逃生**：任何时候连按 3 次 `Esc`（不带修饰键），立即夺回本机控制权。
-- **设置**：托盘菜单可调 对端方位、单向从属、反转滚轮、Ctrl↔Cmd 交换、开机自启等，修改即时生效。
+首次运行不会自动复制原 MouseShare 的设置或私钥。原版和本版不要同时启用互控，以免竞争输入钩子或监听端口。关闭设置窗口会继续在托盘运行；从托盘菜单退出可结束程序。
 
-## 已知限制
+## 本地构建
 
-- 仅限同一局域网，不支持公网远程。
-- 不支持 Windows UAC 安全桌面 / 登录界面 / macOS 锁屏界面的输入注入。
-- 两端键盘布局需一致（如均为 QWERTY），不一致时软件会警告。
-- 二进制未签名/未公证，首次运行需按上文手动放行。
-- 全屏独占游戏中鼠标行为可能异常，可用托盘「暂停互控」规避。
+需要 Rust stable（edition 2024）及对应平台的 C 工具链。
 
-## 安全说明
+```powershell
+# Windows：在 Visual Studio 开发者 PowerShell 中执行（需要 C++ Build Tools / Windows SDK）
+.\scripts\build-windows.ps1
+```
 
-- 设备间全部流量走 QUIC + TLS（自签证书 + 指纹 pinning），配对采用 SAS 6 位码人工核对，未配对设备连接被拒绝。
-- 不采集、不上传任何数据；无任何联网行为（除局域网设备发现与互控本身）。
+```bash
+# Apple Silicon macOS
+bash scripts/build-macos-app.sh
 
-## 从源码构建
+# 校验
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+```
 
-需要 Rust stable。macOS 可运行 `cargo build --release -p ms-app`；项目提供的 Windows 交叉构建流程使用 Zig 与 cargo-zigbuild，执行 `cargo zigbuild --release --target x86_64-pc-windows-gnu -p ms-app`。
+开发时使用 `--log-dir ./logs` 将日志保留在项目内。设置环境变量 `FESILENT_SHOW_WINDOW=1` 可在本次启动直接显示设置窗口。完整设计与验证范围见 [docs/FESILENT-UI.md](docs/FESILENT-UI.md)。
 
-公开仓库暂未附加开源许可证；除 GitHub 依法提供的浏览与 Fork 权限外，其他权利保留。
+## 使用范围
+
+仅支持局域网，手动连接目前使用 IPv4。网络继续沿用上游 QUIC/TLS、UDP 53728 和协议，不支持公网远程桌面或屏幕画面传输。Windows UAC 安全桌面、系统登录界面和 Mac 锁屏不接受输入注入。
+
+自动构建与界面检查不能替代双机实际互控、Mac 授权和输入手感测试；验证记录会明确区分这些结果。

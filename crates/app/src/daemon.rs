@@ -22,7 +22,7 @@ use ms_proto::{Edge, Layout, Msg, Ping, Pong};
 
 use crate::cli::Args;
 use crate::clip;
-use crate::config::Config;
+use crate::config::{Config, DEFAULT_PEER_PORT, normalize_peer_address};
 use crate::status::ConnStatus;
 use crate::xfer;
 
@@ -142,32 +142,61 @@ pub fn run_until(
     running: Arc<AtomicBool>,
     status: Arc<ConnStatus>,
 ) -> bool {
+    status.set_connected(false);
+    status.clear_error();
+    // UI 与 CLI 共用此入口：先验证，再创建身份/监听端点，非法地址不能进入重试循环。
+    let mut args = args.clone();
+    args.connect = match normalize_peer_address(args.connect.as_deref().unwrap_or_default()) {
+        Ok(connect) => connect,
+        Err(message) => {
+            status.set_error(message);
+            tracing::warn!(target: "mouseshare::app", "对端地址格式不正确，互控未启动");
+            return false;
+        }
+    };
+    args.serve = args.connect.is_none();
     let rt = match tokio::runtime::Runtime::new() {
         Ok(r) => r,
         Err(e) => {
+            status.set_error("无法启动连接服务，请退出软件后重新打开。");
             tracing::error!(target: "mouseshare::app", error = %e, "创建运行时失败");
             return false;
         }
     };
-    match rt.block_on(run_async(args, &config, running, status)) {
-        Ok(()) => true,
+    finish_run(
+        rt.block_on(run_async(&args, &config, running, Arc::clone(&status))),
+        &status,
+    )
+}
+
+/// 所有异步退出路径共用的状态收尾，包括重连退避期间的提前暂停。
+fn finish_run(result: Result<(), String>, status: &ConnStatus) -> bool {
+    status.set_connected(false);
+    match result {
+        Ok(()) => {
+            status.clear_error();
+            true
+        }
         Err(e) => {
+            if status.last_error().is_none() {
+                status.set_error("连接服务启动失败，请退出软件后重新打开，并确认 Mac 已授予辅助功能权限。");
+            }
             tracing::error!(target: "mouseshare::app", error = %e, "守护进程退出");
             false
         }
     }
 }
 
-/// 应用配置目录（mac `~/Library/Application Support/MouseShare` / win `%APPDATA%\MouseShare`）。
+/// 应用配置目录（mac `~/Library/Application Support/FesilentMouse` / win `%APPDATA%\MouseShare`）。
 fn data_dir() -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     {
         std::env::var_os("HOME")
-            .map(|h| PathBuf::from(h).join("Library/Application Support/MouseShare"))
+            .map(|h| PathBuf::from(h).join("Library/Application Support/FesilentMouse"))
     }
     #[cfg(target_os = "windows")]
     {
-        std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("MouseShare"))
+        std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("FesilentMouse"))
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
@@ -219,14 +248,25 @@ async fn run_async(
     running: Arc<AtomicBool>,
     status: Arc<ConnStatus>,
 ) -> Result<(), String> {
-    let port = args.port.unwrap_or(53728);
-    let id = load_or_create_identity()?;
-    let bind: SocketAddr = SocketAddr::from((
+    let platform = make_platform();
+    if !platform.has_input_permission() {
+        let message = "请在 Mac 的「系统设置 → 隐私与安全性 → 辅助功能」中勾选本软件，再启用互控。";
+        status.set_error(message);
+        return Err(message.into());
+    }
+    let port = args.port.unwrap_or(DEFAULT_PEER_PORT);
+    let id = load_or_create_identity().map_err(|e| {
+        status.set_error("无法读取或保存配对身份，请确认当前用户可以写入软件的配置目录。");
+        e
+    })?;
+    let bind = SocketAddr::from((
         Ipv4Addr::UNSPECIFIED,
         if args.connect.is_some() { 0 } else { port },
     ));
-    let ep = Endpoint::new(bind, &id).map_err(|e| e.to_string())?;
-    let platform = make_platform();
+    let ep = Endpoint::new(bind, &id).map_err(|e| {
+        status.set_error("无法打开连接端口，请确认没有重复运行的软件实例，再暂停并重新启用互控。");
+        e.to_string()
+    })?;
     let trust_path = data_dir().map(|d| d.join("trust.json"));
 
     // 自动重连循环：会话因断连结束、但仍处「启用」态（running=true）时回到发现/重连，
@@ -251,12 +291,16 @@ async fn run_async(
             Ok(Some(c)) => c,
             Ok(None) => break, // 发现等待中收到暂停
             Err(e) => {
+                if running.load(Ordering::Acquire) {
+                    status.set_error("尚未连接。请确认两台电脑在同一局域网，Mac 端地址留空并启用互控；Windows 端填写 Mac 的 IP，且防火墙允许 UDP 53728。");
+                }
                 tracing::warn!(target: "mouseshare::app", error = %e, "建立连接失败，将重试");
                 continue;
             }
         };
         tracing::info!(target: "mouseshare::app", peer = %conn.remote_addr(), "已连接对端");
         if !check_trust(&conn, &id, trust_path.as_deref(), &mut rejected_logged) {
+            status.set_error("配对验证未通过。请确认连接的是已配对的电脑，必要时重新配对。");
             conn.close();
             continue;
         }
@@ -286,8 +330,17 @@ async fn run_async(
                 }
             };
 
-        if let Err(e) = run_session(&conn, &platform, args, config, &running, &status).await {
-            tracing::warn!(target: "mouseshare::app", error = %e, "会话异常");
+        match run_session(&conn, &platform, args, config, &running, &status).await {
+            Err(e) => {
+                if running.load(Ordering::Acquire) {
+                    status.set_error("互控会话启动失败。请确认 Mac 已授予辅助功能权限、两端均已启用互控，再暂停并重新连接。");
+                }
+                tracing::warn!(target: "mouseshare::app", error = %e, "会话异常");
+            }
+            Ok(()) if running.load(Ordering::Acquire) => {
+                status.set_error("连接已中断，正在重连。请确认 Mac 仍在运行、已启用互控，并且两台电脑仍在同一局域网。");
+            }
+            Ok(()) => {}
         }
         status.set_connected(false);
         if running.load(Ordering::Acquire) {
@@ -309,7 +362,7 @@ async fn establish_conn(
     if let Some(addr) = &args.connect {
         let sa: SocketAddr = addr
             .parse()
-            .map_err(|_| format!("无效地址 {addr}（应为 IP:端口）"))?;
+            .map_err(|_| "对端地址格式不正确，请填写 IPv4 或 IPv4:端口。".to_string())?;
         tracing::info!(target: "mouseshare::app", addr = %sa, "手动直连对端");
         return Ok(Some(ep.connect(sa).await.map_err(|e| e.to_string())?));
     }
@@ -798,6 +851,45 @@ async fn apply(
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    #[test]
+    fn 正常暂停统一清理错误而失败保留可见提示() {
+        let status = ConnStatus::new();
+        status.set_error("连接失败，正在重试");
+        assert!(finish_run(Ok(()), &status));
+        assert_eq!(status.last_error(), None);
+        assert!(!status.connected());
+
+        status.set_error("请在 Mac 端授予辅助功能权限");
+        assert!(!finish_run(Err("internal detail".into()), &status));
+        assert_eq!(status.last_error().as_deref(), Some("请在 Mac 端授予辅助功能权限"));
+
+        status.clear_error();
+        assert!(!finish_run(Err("internal detail".into()), &status));
+        let error = status.last_error().unwrap();
+        assert!(error.contains("连接服务启动失败"));
+        assert!(!error.contains("internal detail"));
+    }
+
+    #[test]
+    fn 非法连接地址在启动前退出并保留可见错误() {
+        let args = Args {
+            connect: Some("private pasted text".into()),
+            ..Args::default()
+        };
+        let status = Arc::new(ConnStatus::new());
+        let config = Arc::new(Mutex::new(Config::from_args(&args)));
+        assert!(!run_until(
+            &args,
+            config,
+            Arc::new(AtomicBool::new(true)),
+            Arc::clone(&status),
+        ));
+        assert!(!status.connected());
+        let error = status.last_error().unwrap();
+        assert!(error.contains("有效的局域网 IPv4"));
+        assert!(!error.contains("private pasted text"));
+    }
 
     fn cfg(side: &str, no_takeover: bool, invert: bool, swap: bool) -> Arc<Mutex<Config>> {
         Arc::new(Mutex::new(Config {

@@ -1,4 +1,4 @@
-//! mouseshare 主程序：组装各层 + 托盘（DEVELOPMENT.md §2.2）。
+//! Fesilent Mouse 主程序：组装各层 + 托盘（DEVELOPMENT.md §2.2）。
 //!
 //! Windows 发布构建用 GUI 子系统：双击/启动**不弹控制台黑窗**，纯托盘运行、托盘退出。
 //! 调试构建保留控制台，便于看 println/日志。
@@ -44,7 +44,7 @@ fn main() -> ExitCode {
         Err(e) => {
             eprintln!("{e}");
             eprintln!(
-                "用法: mouseshare [--no-tray] [--loopback] [--port <u16>] \
+                "用法: fesilent-mouse [--no-tray] [--loopback] [--port <u16>] \
                  [--log-dir <dir>] [--record <file>|--replay <file>]"
             );
             return ExitCode::from(2);
@@ -80,7 +80,7 @@ fn main() -> ExitCode {
         os = std::env::consts::OS,
         arch = std::env::consts::ARCH,
         ?args,
-        "MouseShare 启动"
+        "Fesilent Mouse 启动"
     );
 
     // 录制/回放模式（T-110，开发工具；触发 H-1/H-5 实测）
