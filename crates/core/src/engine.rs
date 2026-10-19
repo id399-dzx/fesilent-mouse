@@ -948,30 +948,6 @@ mod tests {
         assert!(out.inject.contains(&Inject::ReleaseAll), "断连必释放注入键");
     }
 
-    fn controlled_engine() -> Engine {
-        let mut e = Engine::new(
-            rect(1000.0, 1000.0),
-            rect(1000.0, 1000.0),
-            Layout {
-                peer_position: Edge::Left,
-            },
-            EdgeConfig::default(),
-        );
-        e.feed_peer(Msg::from(proto::EnterScreen {
-            entry_edge: Edge::Left,
-            ratio: 0.5,
-        }));
-        assert_eq!(e.state(), ControlState::Controlled);
-        e
-    }
-
-    fn key(hid: u16, down: bool) -> InputEvent {
-        InputEvent::Key {
-            key: HidKey(hid),
-            down,
-        }
-    }
-
     #[test]
     fn 迟滞_入口贴边不被瞬间弹回_离带后回边才交还() {
         let mut a = Engine::new(
