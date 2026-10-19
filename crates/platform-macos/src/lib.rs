@@ -24,6 +24,7 @@ pub mod inject;
 #[cfg(target_os = "macos")]
 pub mod permission;
 
+#[cfg(target_os = "macos")]
 pub mod power_monitor;
 
 #[cfg(target_os = "macos")]

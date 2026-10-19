@@ -233,14 +233,16 @@ impl TransferCenter {
         let now = Instant::now();
         let histories = self.with(|list| {
             self.show_request.store(false, Ordering::Release);
-            list.iter_mut().filter_map(|entry| {
-                if !matches!(entry.phase, Phase::Active | Phase::Confirm) {
-                    return None;
-                }
-                entry.cancel.store(true, Ordering::Release);
-                entry.decision.store(DECISION_REJECT, Ordering::Release);
-                transition(entry, Phase::Cancelled, now)
-            }).collect::<Vec<_>>()
+            list.iter_mut()
+                .filter_map(|entry| {
+                    if !matches!(entry.phase, Phase::Active | Phase::Confirm) {
+                        return None;
+                    }
+                    entry.cancel.store(true, Ordering::Release);
+                    entry.decision.store(DECISION_REJECT, Ordering::Release);
+                    transition(entry, Phase::Cancelled, now)
+                })
+                .collect::<Vec<_>>()
         });
         for history in histories {
             self.push_history(history);
@@ -366,7 +368,8 @@ impl TransferCenter {
 
 /// 终态不可逆；无论是任务自行结束还是会话统一取消，每条传输只产生一次历史。
 fn transition(entry: &mut Entry, phase: Phase, now: Instant) -> Option<HistoryItem> {
-    if entry.phase == phase || matches!(entry.phase, Phase::Done | Phase::Failed | Phase::Cancelled) {
+    if entry.phase == phase || matches!(entry.phase, Phase::Done | Phase::Failed | Phase::Cancelled)
+    {
         return None;
     }
     let previous = entry.phase;
@@ -381,7 +384,11 @@ fn transition(entry: &mut Entry, phase: Phase, now: Instant) -> Option<HistoryIt
         Phase::Done | Phase::Failed | Phase::Cancelled => Some(HistoryItem {
             name: entry.name.clone(),
             dir: entry.dir,
-            bytes: if phase == Phase::Done { entry.total } else { entry.transferred },
+            bytes: if phase == Phase::Done {
+                entry.total
+            } else {
+                entry.transferred
+            },
             outcome: phase,
             secs: now.duration_since(entry.rate.started).as_secs(),
         }),
@@ -530,13 +537,36 @@ mod tests {
         assert!(!done.is_cancelled(), "已完成任务不应被取消");
         assert_eq!(pending.decision.load(Ordering::Acquire), DECISION_REJECT);
         let views = c.snapshot();
-        assert_eq!(views.iter().find(|v| v.id == pending.id).unwrap().phase, Phase::Cancelled);
-        assert_eq!(views.iter().find(|v| v.id == active.id).unwrap().phase, Phase::Cancelled);
-        assert_eq!(views.iter().find(|v| v.id == done.id).unwrap().phase, Phase::Done);
+        assert_eq!(
+            views.iter().find(|v| v.id == pending.id).unwrap().phase,
+            Phase::Cancelled
+        );
+        assert_eq!(
+            views.iter().find(|v| v.id == active.id).unwrap().phase,
+            Phase::Cancelled
+        );
+        assert_eq!(
+            views.iter().find(|v| v.id == done.id).unwrap().phase,
+            Phase::Done
+        );
         let history = c.history();
         assert_eq!(history.len(), 3);
-        assert_eq!(history.iter().find(|item| item.name == "active.bin").unwrap().bytes, 1234);
-        assert_eq!(history.iter().find(|item| item.name == "done.bin").unwrap().outcome, Phase::Done);
+        assert_eq!(
+            history
+                .iter()
+                .find(|item| item.name == "active.bin")
+                .unwrap()
+                .bytes,
+            1234
+        );
+        assert_eq!(
+            history
+                .iter()
+                .find(|item| item.name == "done.bin")
+                .unwrap()
+                .outcome,
+            Phase::Done
+        );
 
         // 模拟正在结束的后台任务返回迟到成功/失败，以及陈旧的确认按钮事件。
         c.cancel_active();
@@ -549,6 +579,13 @@ mod tests {
         assert!(!c.has_active());
         assert_eq!(pending.decision.load(Ordering::Acquire), DECISION_REJECT);
         assert_eq!(c.history().len(), 3, "终态不可逆且历史不重复落账");
-        assert_eq!(c.snapshot().iter().find(|v| v.id == active.id).unwrap().transferred, 1234);
+        assert_eq!(
+            c.snapshot()
+                .iter()
+                .find(|v| v.id == active.id)
+                .unwrap()
+                .transferred,
+            1234
+        );
     }
 }

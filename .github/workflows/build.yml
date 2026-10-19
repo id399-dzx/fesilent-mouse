@@ -102,7 +102,7 @@ jobs:
       - name: Package macOS application
         run: |
           file dist/fesilent-mouse.app/Contents/MacOS/fesilent-mouse
-          lipo -verify_arch arm64 dist/fesilent-mouse.app/Contents/MacOS/fesilent-mouse
+          lipo dist/fesilent-mouse.app/Contents/MacOS/fesilent-mouse -verify_arch arm64
           codesign --verify --deep --strict dist/fesilent-mouse.app
           ditto -c -k --sequesterRsrc --keepParent dist/fesilent-mouse.app dist/fesilent-mouse-macOS-arm64.zip
           cd dist
