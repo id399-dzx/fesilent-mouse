@@ -1561,7 +1561,7 @@ dependencies = [
 
 [[package]]
 name = "ms-app"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "egui",
  "egui_glow",
@@ -1588,7 +1588,7 @@ dependencies = [
 
 [[package]]
 name = "ms-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "crossbeam-queue",
  "ms-platform",
@@ -1601,7 +1601,7 @@ dependencies = [
 
 [[package]]
 name = "ms-net"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "bytes",
  "futures-util",
@@ -1623,7 +1623,7 @@ dependencies = [
 
 [[package]]
 name = "ms-platform"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde",
  "thiserror 2.0.18",
@@ -1631,7 +1631,7 @@ dependencies = [
 
 [[package]]
 name = "ms-platform-macos"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "core-foundation 0.10.1",
  "core-foundation-sys",
@@ -1646,7 +1646,7 @@ dependencies = [
 
 [[package]]
 name = "ms-platform-windows"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ms-platform",
  "png 0.17.16",
@@ -1657,7 +1657,7 @@ dependencies = [
 
 [[package]]
 name = "ms-premium-api"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde",
  "thiserror 2.0.18",
@@ -1665,7 +1665,7 @@ dependencies = [
 
 [[package]]
 name = "ms-proto"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "bincode",
  "proptest",

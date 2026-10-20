@@ -4,6 +4,11 @@
 
 基于 [Yujay-Z/MouseShare](https://github.com/Yujay-Z/MouseShare) 的原生 Rust / egui 工具。本 Fork 保留上游核心与作者历史，重新设计设置界面，并改进连接配置体验。来源和权利边界见 [NOTICE.md](NOTICE.md)，上游原说明见 [docs/UPSTREAM-README.md](docs/UPSTREAM-README.md)。
 
+## 0.2.1 的更新
+
+- 使用新的黑白品牌图标，覆盖 Windows EXE、主窗口、Mac Dock 及菜单栏/托盘。
+- [下载 v0.2.1 预览版](https://github.com/id399-dzx/fesilent-mouse/releases/tag/v0.2.1)：Windows x64 免安装 EXE 与 Apple Silicon Mac ZIP。
+
 ## 0.2.0 的改进
 
 - 官网同风格的原生设备工作台：雾白与淡紫粉背景、白色圆角面板、黑色胶囊按钮，窄窗口自动重排导航。

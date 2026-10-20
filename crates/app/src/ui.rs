@@ -97,6 +97,7 @@ impl GlutinWindowContext {
             .with_inner_size(winit::dpi::LogicalSize::new(1040.0, 760.0))
             .with_min_inner_size(winit::dpi::LogicalSize::new(680.0, 560.0))
             .with_title("Fesilent Mouse")
+            .with_window_icon(load_window_icon())
             .with_visible(false);
         // 自测用：MS_UI_POS="x,y" 指定窗口位置（避开遮挡好截图）；发布无此 env 不生效
         if let Some(p) = std::env::var_os("MS_UI_POS").and_then(|s| s.into_string().ok()) {
@@ -395,9 +396,10 @@ fn install_cjk_font(ctx: &egui::Context) {
     tracing::warn!(target: "mouseshare::ui", "未找到系统中文字体，界面中文可能为方块");
 }
 
-fn load_tray_icon() -> Option<Icon> {
-    let bytes: &[u8] = include_bytes!("../icons/tray.png");
-    let decoder = png::Decoder::new(bytes);
+/// 主窗口与托盘共用 RGBA 解码，展开调色板和透明色，兼容不同 PNG 导出格式。
+fn load_icon_rgba(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
+    let mut decoder = png::Decoder::new(bytes);
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
     let mut reader = decoder.read_info().ok()?;
     let mut buf = vec![0u8; reader.output_buffer_size()];
     let info = reader.next_frame(&mut buf).ok()?;
@@ -407,9 +409,28 @@ fn load_tray_icon() -> Option<Icon> {
             .chunks(3)
             .flat_map(|p| [p[0], p[1], p[2], 255])
             .collect(),
-        _ => return None,
+        png::ColorType::Grayscale => buf[..info.buffer_size()]
+            .iter()
+            .flat_map(|value| [*value, *value, *value, 255])
+            .collect(),
+        png::ColorType::GrayscaleAlpha => buf[..info.buffer_size()]
+            .chunks(2)
+            .flat_map(|p| [p[0], p[0], p[0], p[1]])
+            .collect(),
+        png::ColorType::Indexed => return None,
     };
-    Icon::from_rgba(rgba, info.width, info.height).ok()
+    Some((rgba, info.width, info.height))
+}
+
+/// Windows 标题栏与运行中的任务栏使用主图标；macOS Dock 由应用包内 ICNS 提供。
+fn load_window_icon() -> Option<winit::window::Icon> {
+    let (rgba, width, height) = load_icon_rgba(include_bytes!("../icons/icon.png"))?;
+    winit::window::Icon::from_rgba(rgba, width, height).ok()
+}
+
+fn load_tray_icon() -> Option<Icon> {
+    let (rgba, width, height) = load_icon_rgba(include_bytes!("../icons/tray.png"))?;
+    Icon::from_rgba(rgba, width, height).ok()
 }
 
 /// 构建一份托盘菜单（toggle 文字随 running 变）。
