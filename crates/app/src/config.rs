@@ -4,7 +4,7 @@
 //! 路径：mac `~/Library/Application Support/FesilentMouse/config.json`，
 //! Windows `%APPDATA%\FesilentMouse\config.json`。
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -72,12 +72,20 @@ use crate::cli::Args;
 
 pub(crate) const DEFAULT_PEER_PORT: u16 = 53728;
 
-/// 空地址启用自动发现；裸 IPv4 补默认端口，显式端口必须为 1..=65535。
+/// 空地址启用自动发现；IPv4 缺端口或冒号后留空时补默认端口。
+/// 显式端口必须为 1..=65535，多余冒号和非法端口不做猜测修正。
 /// 不把无效输入拼进错误文案，避免把误粘贴的内容显示到日志或界面。
 pub(crate) fn normalize_peer_address(input: &str) -> Result<Option<String>, String> {
     let input = input.trim();
     if input.is_empty() {
         return Ok(None);
+    }
+    if let Some(host) = input.strip_suffix(':')
+        && let Ok(ip) = host.trim().parse::<Ipv4Addr>()
+    {
+        return Ok(Some(
+            SocketAddr::new(ip.into(), DEFAULT_PEER_PORT).to_string(),
+        ));
     }
     if let Ok(addr) = input.parse::<SocketAddr>() {
         if addr.is_ipv6() {
@@ -88,7 +96,7 @@ pub(crate) fn normalize_peer_address(input: &str) -> Result<Option<String>, Stri
         if addr.port() == 0 {
             return Err("对端端口必须为 1–65535，默认端口是 53728。".into());
         }
-        return Ok(Some(input.to_string()));
+        return Ok(Some(addr.to_string()));
     }
     if let Ok(ip) = input.parse::<IpAddr>() {
         if ip.is_ipv6() {
@@ -136,6 +144,9 @@ pub(crate) fn normalize_scroll_speed(value: f64) -> f64 {
 pub struct Config {
     #[serde(default = "default_config_ver")]
     pub config_ver: u32,
+    /// 本机监听端口；缺失时使用协议约定的默认端口。
+    #[serde(default)]
+    pub port: Option<u16>,
     /// 对端 IPv4 或 `IPv4:端口`；为空则本端监听（serve），否则主动连接。
     #[serde(default)]
     pub connect: Option<String>,
@@ -193,6 +204,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             config_ver: 1,
+            port: None,
             connect: None,
             side: default_side(),
             no_takeover: false,
@@ -220,6 +232,7 @@ impl Config {
     pub fn from_args(args: &Args) -> Self {
         Self {
             config_ver: 1,
+            port: args.port.filter(|port| *port != 0),
             connect: args.connect.clone(),
             side: args.side.clone(),
             no_takeover: args.no_takeover,
@@ -243,6 +256,7 @@ impl Config {
             Err(_) => self.connect.clone(),
         };
         Args {
+            port: self.port.filter(|port| *port != 0),
             serve: connect.is_none(),
             connect,
             side: self.side.clone(),
@@ -306,6 +320,19 @@ pub fn save(cfg: &Config) -> Result<(), String> {
 
 impl Config {
     pub fn normalize(&mut self) {
+        // 监听端口 0 会让系统随机分配，不能作为可复制的固定连接入口。
+        self.port = self.port.filter(|port| *port != 0);
+        // 有效地址统一回写，非法地址保留到连接前明确报错，不能默默改成自动发现。
+        if let Ok(connect) = normalize_peer_address(self.connect.as_deref().unwrap_or_default()) {
+            self.connect = connect;
+        }
+        for record in &mut self.devices.records {
+            if let Some(address) = &record.address
+                && let Ok(normalized) = normalize_peer_address(address)
+            {
+                record.address = normalized;
+            }
+        }
         if !self.display_offset.is_finite() {
             self.display_offset = 0.0;
         }
@@ -430,6 +457,68 @@ mod tests {
     }
 
     #[test]
+    fn 缺失端口包括冒号后留空时补默认端口() {
+        for input in ["192.168.1.20:", " 192.168.1.20:  "] {
+            assert_eq!(
+                normalize_peer_address(input).unwrap().as_deref(),
+                Some("192.168.1.20:53728")
+            );
+        }
+        for input in [
+            "192.168.1.20::",
+            "192.168.1.20: :53728",
+            "192.168.1.20:0",
+            "192.168.1.20:65536",
+            "192.168.1.20:abc",
+        ] {
+            assert!(normalize_peer_address(input).is_err(), "应拒绝 {input}");
+        }
+    }
+
+    #[test]
+    fn 配置规范化写回补全端口但不吞掉非法地址() {
+        let mut cfg = Config {
+            connect: Some(" 192.168.1.20: ".into()),
+            ..Config::default()
+        };
+        cfg.normalize();
+        assert_eq!(cfg.connect.as_deref(), Some("192.168.1.20:53728"));
+        cfg.connect = Some("192.168.1.20:0".into());
+        cfg.normalize();
+        assert_eq!(cfg.connect.as_deref(), Some("192.168.1.20:0"));
+        cfg.devices.records.push(crate::devices::DeviceRecord {
+            address: Some("192.168.1.30:".into()),
+            ..crate::devices::DeviceRecord::default()
+        });
+        cfg.normalize();
+        assert_eq!(
+            cfg.devices.records[0].address.as_deref(),
+            Some("192.168.1.30:53728")
+        );
+    }
+
+    #[test]
+    fn 自定义监听端口往返配置与运行参数() {
+        let args = Args {
+            port: Some(60000),
+            ..Args::default()
+        };
+        let cfg = Config::from_args(&args);
+        assert_eq!(cfg.port, Some(60000));
+        let restored: Config = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(restored.to_args(None).port, Some(60000));
+        let legacy: Config = serde_json::from_str(r#"{"config_ver":1}"#).unwrap();
+        assert_eq!(legacy.to_args(None).port, None);
+        let mut invalid = Config {
+            port: Some(0),
+            ..Config::default()
+        };
+        invalid.normalize();
+        assert_eq!(invalid.port, None);
+        assert_eq!(invalid.to_args(None).port, None);
+    }
+
+    #[test]
     fn ipv6提示使用局域网ipv4而非接受无法连接的地址() {
         for input in [
             "::1",
@@ -456,7 +545,6 @@ mod tests {
             "[::1]:0",
             "127.0.0.1:65536",
             "127.0.0.1:-1",
-            "127.0.0.1:",
             "999.1.1.1",
             "localhost:53728",
             "https://192.168.1.20",

@@ -22,6 +22,9 @@ pub mod clipboard;
 pub mod inject;
 
 #[cfg(target_os = "macos")]
+pub mod gui_reopen;
+
+#[cfg(target_os = "macos")]
 pub mod permission;
 
 #[cfg(target_os = "macos")]

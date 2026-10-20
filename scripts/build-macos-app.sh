@@ -2,7 +2,7 @@
 # 编译并打包 Fesilent Mouse，与上游使用独立 bundle id。
 set -euo pipefail
 cd "$(dirname "$0")/.."
-VERSION="${1:-0.2.1}"
+VERSION="${1:-0.2.2}"
 BIN="target/release/fesilent-mouse"
 APP="dist/fesilent-mouse.app"
 ICON_SRC="crates/app/icons/icon.png"

@@ -7,6 +7,8 @@ use ms_core::control::ControlState;
 
 #[path = "device_catalog.rs"]
 mod device_catalog;
+#[path = "local_network.rs"]
+mod local_network;
 #[path = "theme.rs"]
 mod theme;
 #[path = "workspace.rs"]
@@ -225,14 +227,13 @@ impl App {
                         }
                         if self.section != Section::Connection
                             && self.handle.status.last_error().is_some()
+                            && let Some(error) = self.handle.status.last_error()
                         {
-                            if let Some(error) = self.handle.status.last_error() {
-                                notice(ui, &error, ERROR);
-                                if ui.link("查看连接与设备").clicked() {
-                                    self.section = Section::Connection;
-                                }
-                                ui.add_space(12.0);
+                            notice(ui, &error, ERROR);
+                            if ui.link("查看连接与设备").clicked() {
+                                self.section = Section::Connection;
                             }
+                            ui.add_space(12.0);
                         }
                         match self.section {
                             Section::Connection => self.draw_connection(ui, &mut cfg, &mut dirty),
@@ -342,10 +343,10 @@ impl App {
                     {
                         self.section = Section::Sharing;
                     }
-                    if let Some((message, when)) = &self.settings_notice {
-                        if when.elapsed() < Duration::from_secs(4) {
-                            ui.label(RichText::new(message).size(11.0).color(GREEN));
-                        }
+                    if let Some((message, when)) = &self.settings_notice
+                        && when.elapsed() < Duration::from_secs(4)
+                    {
+                        ui.label(RichText::new(message).size(11.0).color(GREEN));
                     }
                 });
             });
@@ -377,11 +378,11 @@ impl App {
             return false;
         }
         let cfg = &normalized;
-        if !self.ui_preview {
-            if let Err(error) = config::save(cfg) {
-                self.form_error = Some(format!("设置保存失败：{error}"));
-                return false;
-            }
+        if !self.ui_preview
+            && let Err(error) = config::save(cfg)
+        {
+            self.form_error = Some(format!("设置保存失败：{error}"));
+            return false;
         }
         match self.config.lock() {
             Ok(mut shared) => {
@@ -408,7 +409,7 @@ impl App {
             match config::normalize_peer_address(&self.peer_ip) {
                 Ok(Some(address)) => Some(address),
                 Ok(None) => {
-                    self.form_error = Some("请输入 Mac 的 IP，或选择自动发现。".into());
+                    self.form_error = Some("请输入对端的 IP，或选择自动发现。".into());
                     return false;
                 }
                 Err(error) => {
@@ -624,6 +625,8 @@ impl App {
 
     fn draw_connection(&mut self, ui: &mut egui::Ui, cfg: &mut Config, dirty: &mut bool) {
         self.draw_connection_status(ui, cfg);
+        ui.add_space(15.0);
+        self.draw_local_connection_addresses(ui, cfg);
         if self.handle.status.connected() && !cfg.onboarding_done {
             ui.add_space(15.0);
             card(ui, "连接成功，试试这三步", "", |ui| {
@@ -708,6 +711,47 @@ impl App {
         self.draw_device_catalog(ui, cfg, dirty);
     }
 
+    fn draw_local_connection_addresses(&mut self, ui: &mut egui::Ui, cfg: &Config) {
+        let port = cfg.port.unwrap_or(config::DEFAULT_PEER_PORT);
+        let addresses = local_network::connection_addresses(&self.local_ips, port);
+        card(
+            ui,
+            "本机连接地址",
+            "自动识别已连接网络，地址变化后自动更新。可复制到另一台电脑手动连接。",
+            |ui| {
+                if addresses.is_empty() {
+                    ui.label(
+                        RichText::new("暂未识别到局域网 IPv4。连接 Wi-Fi 或网线后会自动更新。")
+                            .small()
+                            .color(MUTED),
+                    );
+                }
+                for address in &addresses {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new(address).monospace().size(17.0).strong());
+                        if secondary_button(ui, "复制地址")
+                            .on_hover_text("复制本机 IPv4 和监听端口")
+                            .clicked()
+                        {
+                            ui.ctx().copy_text(address.clone());
+                            self.connection_notice = Some(format!("已复制 {address}"));
+                        }
+                    });
+                }
+                if !self.handle.is_running() {
+                    ui.label(
+                        RichText::new("启用连接后，其他电脑才能通过此地址接入。")
+                            .small()
+                            .color(MUTED),
+                    );
+                }
+                if let Some(message) = &self.connection_notice {
+                    ui.label(RichText::new(message).small().color(GREEN));
+                }
+            },
+        );
+    }
+
     fn draw_connection_details(&mut self, ui: &mut egui::Ui, cfg: &mut Config) {
         card(ui, "", "", |ui| {
             let force_open = ui.ctx().data_mut(|data| {
@@ -732,16 +776,28 @@ impl App {
                     });
                     ui.add_space(5.0);
                     if self.manual_connection {
-                        ui.label(RichText::new("Mac 的局域网 IPv4").small().color(MUTED));
-                        ui.add_sized(
+                        ui.label(RichText::new("对端的局域网 IPv4").small().color(MUTED));
+                        let response = ui.add_sized(
                             [ui.available_width().min(370.0), 35.0],
                             egui::TextEdit::singleline(&mut self.peer_ip)
                                 .hint_text("例如 192.168.1.20，端口可省略")
                                 .margin(egui::Margin::symmetric(11, 8)),
                         );
+                        if response.lost_focus()
+                            && let Ok(Some(address)) = config::normalize_peer_address(&self.peer_ip)
+                        {
+                            self.peer_ip = address;
+                        }
+                        ui.label(
+                            RichText::new(
+                                "端口省略或留空时自动补为 53728，已填写的有效端口会保留。",
+                            )
+                            .small()
+                            .color(MUTED),
+                        );
                     } else {
                         ui.label(
-                            RichText::new("搜索同一网络中的 Mac；Mac 端保持地址留空并等待接入。")
+                            RichText::new("搜索同一网络中的设备；接收端使用自动发现并启用连接。")
                                 .small()
                                 .color(MUTED),
                         );
@@ -782,33 +838,6 @@ impl App {
                     }
                     ui.add_space(8.0);
                     ui.separator();
-                }
-                ui.add_space(7.0);
-                ui.label(RichText::new("本机 IPv4 · 点击复制").small().color(MUTED));
-                ui.horizontal_wrapped(|ui| {
-                    if self.local_ips.is_empty() {
-                        ui.label(RichText::new("未识别到网络地址").small().color(MUTED));
-                    }
-                    for address in &self.local_ips {
-                        if ui
-                            .button(RichText::new(address).monospace().small())
-                            .on_hover_text("复制这个地址")
-                            .clicked()
-                        {
-                            ui.ctx().copy_text(address.clone());
-                            self.connection_notice = Some(format!("已复制 {address}"));
-                        }
-                    }
-                    if ui.small_button("刷新").clicked() {
-                        self.local_ips = local_ipv4_addresses();
-                    }
-                });
-                if let Some(address) = cfg.connect.as_deref().and_then(route_local_address) {
-                    ui.label(
-                        RichText::new(format!("连接此设备使用的本机地址：{address}"))
-                            .small()
-                            .color(MUTED),
-                    );
                 }
                 if let Some(message) = &self.connection_notice {
                     ui.label(RichText::new(message).small().color(GREEN));
@@ -882,17 +911,18 @@ impl App {
                 .data_mut(|data| data.insert_temp(drag_id, rects.mac.center()));
         }
         let mut mac_rect = rects.mac;
-        if editable && response.dragged() {
-            if let Some(pointer) = response.interact_pointer_pos() {
-                mac_rect = egui::Rect::from_center_size(pointer, rects.mac.size());
-                side = workspace::snapped_side(rects.windows.center(), pointer, side);
-                painter.rect_stroke(
-                    workspace::device_rects(canvas, side).mac,
-                    13,
-                    Stroke::new(1.0_f32, PURPLE),
-                    egui::StrokeKind::Inside,
-                );
-            }
+        if editable
+            && response.dragged()
+            && let Some(pointer) = response.interact_pointer_pos()
+        {
+            mac_rect = egui::Rect::from_center_size(pointer, rects.mac.size());
+            side = workspace::snapped_side(rects.windows.center(), pointer, side);
+            painter.rect_stroke(
+                workspace::device_rects(canvas, side).mac,
+                13,
+                Stroke::new(1.0_f32, PURPLE),
+                egui::StrokeKind::Inside,
+            );
         }
         if editable && response.drag_stopped() {
             if let Some(pointer) = response.interact_pointer_pos() {
@@ -1730,74 +1760,6 @@ fn draw_screen(
     );
 }
 
-/// 只查询路由选出的本机地址，UDP connect 不发送数据包。
-fn route_local_address(peer: &str) -> Option<String> {
-    let peer: std::net::SocketAddr = peer.parse().ok()?;
-    let socket = std::net::UdpSocket::bind(if peer.is_ipv4() {
-        "0.0.0.0:0"
-    } else {
-        "[::]:0"
-    })
-    .ok()?;
-    socket.connect(peer).ok()?;
-    Some(socket.local_addr().ok()?.ip().to_string())
-}
-
-/// 多网卡地址保持可见，避免自动选择 VPN 后让另一台电脑无法连接。
-pub(super) fn local_ipv4_addresses() -> Vec<String> {
-    let mut addresses = Vec::new();
-    #[cfg(target_os = "macos")]
-    {
-        if let Ok(output) = std::process::Command::new("/sbin/ifconfig").output() {
-            for line in String::from_utf8_lossy(&output.stdout).lines() {
-                let mut fields = line.split_whitespace();
-                if fields.next() != Some("inet") {
-                    continue;
-                }
-                if let Some(address) = fields.next()
-                    && let Ok(ip) = address.parse::<std::net::Ipv4Addr>()
-                    && !ip.is_loopback()
-                    && !ip.is_unspecified()
-                    && !ip.is_link_local()
-                {
-                    addresses.push(ip.to_string());
-                }
-            }
-        }
-    }
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        if let Ok(output) = std::process::Command::new("ipconfig")
-            .creation_flags(0x0800_0000)
-            .output()
-        {
-            for line in String::from_utf8_lossy(&output.stdout).lines() {
-                if !line.contains("IPv4") {
-                    continue;
-                }
-                for part in
-                    line.split(|character: char| !(character.is_ascii_digit() || character == '.'))
-                {
-                    if let Ok(ip) = part.parse::<std::net::Ipv4Addr>()
-                        && !ip.is_loopback()
-                        && !ip.is_unspecified()
-                        && !ip.is_link_local()
-                    {
-                        addresses.push(ip.to_string());
-                    }
-                }
-            }
-        }
-    }
-    if addresses.is_empty() {
-        for peer in ["192.168.1.1:53728", "192.168.3.1:53728", "10.0.0.1:53728"] {
-            if let Some(address) = route_local_address(peer) {
-                addresses.push(address);
-            }
-        }
-    }
-    addresses.sort();
-    addresses.dedup();
-    addresses
+pub(super) fn spawn_local_ip_monitor() -> std::sync::mpsc::Receiver<Vec<String>> {
+    local_network::monitor()
 }

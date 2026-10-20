@@ -1,11 +1,13 @@
 # Fesilent Mouse 工程契约（SPEC）
 
-> **Fork 修订（2026-10-19，用户要求更名与 UI 优化）**：下文保留上游历史契约便于溯源。当前显示名为 `Fesilent Mouse`，可执行文件名为 `fesilent-mouse`，版本 `0.2.1`，macOS bundle id 为 `com.fesilent.mouse`。配置、设备身份、日志、接收文件与开机自启标识使用 `FesilentMouse`，不覆盖上游目录。Windows 默认用户安装位置为 `%LOCALAPPDATA%\Programs\FesilentMouse\`，也可直接运行免安装 EXE。crate 名、协议版本、UDP 53728、mDNS 类型和消息格式沿用上游。手动连接只接受局域网 IPv4 或 `IPv4:端口`，裸 IPv4 自动补 53728；非法地址在启动前拒绝。当前目录与 UI 设计详见 `docs/FESILENT-UI.md`。
+> **Fork 修订（2026-10-19，用户要求更名与 UI 优化）**：下文保留上游历史契约便于溯源。当前显示名为 `Fesilent Mouse`，可执行文件名为 `fesilent-mouse`，版本 `0.2.2`，macOS bundle id 为 `com.fesilent.mouse`。配置、设备身份、日志、接收文件与开机自启标识使用 `FesilentMouse`，不覆盖上游目录。Windows 默认用户安装位置为 `%LOCALAPPDATA%\Programs\FesilentMouse\`，也可直接运行免安装 EXE。crate 名、协议版本、UDP 53728、mDNS 类型和消息格式沿用上游。手动连接只接受局域网 IPv4 或 `IPv4:端口`，裸 IPv4 自动补 53728；非法地址在启动前拒绝。当前目录与 UI 设计详见 `docs/FESILENT-UI.md`。
 
 > 本文件固化所有跨会话必须一致的命名、常量与接口契约。
 >
 > **Fork 交互与可靠性修订（2026-10-19，用户授权按 Deskflow 对比建议1–4推进）**：Linux按用户选择暂缓。配置仍为 `config_ver:1`，新增字段均有serde默认：`mac_control`默认false保留旧Mac从属行为；`shortcuts_enabled`、`switch_shortcut`、`lock_shortcut`；`onboarding_done`；`display_offset`默认0保留比例映射、非零为沿边物理像素；`devices`保存完整SHA256身份、名称、可选监听地址、四向位置和活动目标。记录不等同信任，trust.json仍独立pinning；单次一个活动会话，切换必须结束旧会话。无新依赖、协议版本/编号/端口不变。当前运行中的键鼠、控制、心跳共用持久可靠QUIC流，Datagram API尚未用于实际输入，旧通道表为设计目标。临时文件只自动清理带内部前缀和UUID的过期暂存，不再按扩展名删除任意文件。
 > **修改本文件中任何条目须经人确认**（见 CLAUDE.md §2），修改后需全仓搜索同步引用处。
+
+> **启动与连接修订（2026-10-20，用户要求重复启动统一窗口及自动地址/端口）**：当前开发候选版本 `0.2.2`。同一用户普通GUI启动使用应用目录内独占文件锁与鉴权loopback通知，重复启动恢复已有工作台；显式headless/回环、录制、自检和隔离预览不进入此实例范围。`config_ver:1`新增可选`port`字段，默认空表示监听UDP53728；自动显示本机物理网卡IPv4和监听端口；裸IPv4及IPv4后空冒号自动补53728，显式非零端口保留。配置路径、网络协议与已保存设备单活动会话规则不变。使用标准库文件锁，最低Rust声明1.89，无新增依赖。
 
 ## 1. 命名与标识
 

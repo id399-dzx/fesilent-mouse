@@ -28,3 +28,7 @@
 - `dist/icon-update/SHA256SUMS`
 
 原有 `dist/release/v0.2.0/` 和 GitHub Release 资产保持原样。本次只提供带新图标的本地候选包，未发布新版本。图标缓存及真实 Windows 桌面显示没有作为已实测结果；Windows 验证基于编译、资源与包内容。
+
+## 后续发布（F-1012，2026-10-20）
+
+用户随后要求“更新上传”，已同步版本并重建为v0.2.1，公开新图标预览版。新包位于`dist/release/v0.2.1/`，两平台GitHub下载与SHA均通过。完整发布记录见`FESILENT-RELEASE-v0.2.1-VERIFY.md`；以上F-1011本地验收记录保留。

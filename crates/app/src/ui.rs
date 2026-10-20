@@ -484,6 +484,10 @@ enum UserEvent {
     Repaint(Duration),
     /// 请求显示设置窗口（大文件待确认时由传输中心触发，隐藏态也能弹出）。
     ShowWindow,
+    /// 用户再次启动或点击 Dock/Finder，恢复并激活已有设置窗口。
+    ActivateWindow,
+    /// 后台网卡检测完成；主线程更新可复制的本机连接地址。
+    LocalAddressesChanged(Vec<String>),
     /// 首次配对需核对短认证串，窗口隐藏时也必须能发现请求。
     PairingRequested,
     QuitReady,
@@ -522,6 +526,8 @@ struct App {
     pending_forget_device: Option<String>,
     forget_all_pending: bool,
     quitting: bool,
+    activation_pending: bool,
+    instance_accepting: Option<Arc<AtomicBool>>,
 }
 
 impl App {
@@ -535,6 +541,10 @@ impl App {
         if first_run && !ui_preview {
             cfg = Config::from_args(&args);
             let _ = config::save(&cfg);
+        }
+        // 显式命令行端口覆盖本次GUI会话，地址卡片与真正监听端口使用同一配置。
+        if let Some(port) = args.port.filter(|port| *port != 0) {
+            cfg.port = Some(port);
         }
         if ui_preview && std::env::var("FESILENT_UI_PREVIEW_DEVICES").ok().as_deref() == Some("1") {
             for (fingerprint, name, side) in [
@@ -595,12 +605,14 @@ impl App {
             manual_connection,
             connection_notice: None,
             form_error: None,
-            local_ips: views::local_ipv4_addresses(),
+            local_ips: Vec::new(),
             settings_notice: None,
             confirm_forget_devices: false,
             pending_forget_device: None,
             forget_all_pending: false,
             quitting: false,
+            activation_pending: false,
+            instance_accepting: None,
             ui_preview,
         }
     }
@@ -640,6 +652,23 @@ impl App {
         }
     }
 
+    /// 主动重开与自动通知分开处理：仅用户动作恢复最小化并请求键盘焦点。
+    fn activate_window(&mut self) {
+        if self.quitting {
+            return;
+        }
+        let Some(window) = &self.gl_window else {
+            self.activation_pending = true;
+            return;
+        };
+        self.activation_pending = false;
+        window.window().set_minimized(false);
+        window.window().set_visible(true);
+        window.window().focus_window();
+        window.window().request_redraw();
+        tracing::info!(target: "mouseshare::ui", "再次打开：已恢复现有设置窗口");
+    }
+
     /// 处理一次菜单动作（托盘或自测触发，均在主线程）。
     fn on_menu(&mut self, id: &str) {
         match id {
@@ -658,7 +687,7 @@ impl App {
                 self.set_toggle_text(running);
             }
             "settings" => {
-                self.show_window();
+                self.activate_window();
                 // 主动渲染一帧：不等系统 RedrawRequested，规避"被遮挡窗口不重绘"导致的空白
                 self.redraw();
             }
@@ -668,6 +697,9 @@ impl App {
                     return;
                 }
                 self.quitting = true;
+                if let Some(accepting) = &self.instance_accepting {
+                    accepting.store(false, Ordering::Release);
+                }
                 self.handle.stop();
                 let previous = self.handle.thread.take();
                 let proxy = self.proxy.clone();
@@ -825,6 +857,9 @@ impl ApplicationHandler<UserEvent> for App {
         self.gl = Some(gl);
         self.egui_glow = Some(egui_glow);
         self.tray = tray;
+        if self.activation_pending {
+            self.activate_window();
+        }
         // args 已用于首启 config，之后不再需要
         let _ = &self.args;
 
@@ -866,10 +901,10 @@ impl ApplicationHandler<UserEvent> for App {
                     (Some(eg), Some(w)) => Some(eg.on_window_event(w.window(), &other)),
                     _ => None,
                 };
-                if let (Some(resp), Some(w)) = (resp, &self.gl_window) {
-                    if resp.repaint {
-                        w.window().request_redraw();
-                    }
+                if let (Some(resp), Some(w)) = (resp, &self.gl_window)
+                    && resp.repaint
+                {
+                    w.window().request_redraw();
                 }
             }
         }
@@ -892,6 +927,16 @@ impl ApplicationHandler<UserEvent> for App {
                 self.show_window();
                 self.redraw();
             }
+            UserEvent::ActivateWindow => {
+                self.activate_window();
+                self.redraw();
+            }
+            UserEvent::LocalAddressesChanged(addresses) => {
+                if self.local_ips != addresses {
+                    self.local_ips = addresses;
+                    self.redraw();
+                }
+            }
             UserEvent::PairingRequested => {
                 if self.handle.status.pending_pairing().is_some() {
                     self.section = views::Section::Connection;
@@ -903,6 +948,9 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some(accepting) = &self.instance_accepting {
+            accepting.store(false, Ordering::Release);
+        }
         self.handle.stop();
         if let Some(thread) = self.handle.thread.take() {
             let _ = thread.join();
@@ -977,7 +1025,11 @@ fn spawn_control_listener(proxy: EventLoopProxy<UserEvent>) {
 }
 
 /// 运行 UI（托盘 + 设置窗口）。返回是否正常结束。
-pub fn run(args: Args) -> bool {
+pub fn run(
+    args: Args,
+    activation: Option<std::sync::mpsc::Receiver<()>>,
+    instance_accepting: Option<Arc<AtomicBool>>,
+) -> bool {
     let first_run =
         ui_preview_enabled() || config::config_path().map(|p| !p.exists()).unwrap_or(true);
     let event_loop = match EventLoop::<UserEvent>::with_user_event().build() {
@@ -988,6 +1040,44 @@ pub fn run(args: Args) -> bool {
         }
     };
     let proxy = event_loop.create_proxy();
+
+    #[cfg(target_os = "macos")]
+    if !ui_preview_enabled() {
+        let reopen_proxy = proxy.clone();
+        if let Err(error) = ms_platform_macos::gui_reopen::install_reopen_handler(move || {
+            let _ = reopen_proxy.send_event(UserEvent::ActivateWindow);
+        }) {
+            tracing::warn!(target: "mouseshare::ui", %error, "未能安装Dock重开处理");
+        }
+    }
+
+    if let Some(activation) = activation {
+        let activation_proxy = proxy.clone();
+        std::thread::spawn(move || {
+            while activation.recv().is_ok() {
+                if activation_proxy
+                    .send_event(UserEvent::ActivateWindow)
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+    }
+
+    // 网卡查询在后台进行；通过事件唤醒静止或隐藏的窗口，不在GUI线程运行系统命令。
+    let local_addresses = views::spawn_local_ip_monitor();
+    let address_proxy = proxy.clone();
+    std::thread::spawn(move || {
+        for addresses in local_addresses {
+            if address_proxy
+                .send_event(UserEvent::LocalAddressesChanged(addresses))
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
 
     // 托盘菜单事件 → proxy（不在回调里碰 MenuItem，muda MenuItem 非 Send+Sync）
     let p_menu = proxy.clone();
@@ -1000,6 +1090,7 @@ pub fn run(args: Args) -> bool {
         spawn_control_listener(proxy.clone());
     }
     let mut app = App::new(args, first_run, proxy.clone());
+    app.instance_accepting = instance_accepting;
     if !app.ui_preview {
         spawn_transfer_watcher(proxy, Arc::clone(&app.handle.status));
     }

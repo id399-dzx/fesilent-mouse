@@ -9,6 +9,12 @@
 - 使用新的黑白品牌图标，覆盖 Windows EXE、主窗口、Mac Dock 及菜单栏/托盘。
 - [下载 v0.2.1 预览版](https://github.com/id399-dzx/fesilent-mouse/releases/tag/v0.2.1)：Windows x64 免安装 EXE 与 Apple Silicon Mac ZIP。
 
+## 0.2.2 的更新
+
+增加单实例工作台：重复打开会恢复已有窗口，多台电脑在“我的设备”中统一添加、选择和管理。工作台自动显示本机的 `IP:端口` 并可一键复制；手动输入对端IP无需查询端口，省略时默认补为 `53728`，显式有效端口保持不变。
+
+[下载 v0.2.2 预览版](https://github.com/id399-dzx/fesilent-mouse/releases/tag/v0.2.2)：Windows x64 免安装 EXE 与 Apple Silicon Mac ZIP，附 SHA256SUMS。
+
 ## 0.2.0 的改进
 
 - 官网同风格的原生设备工作台：雾白与淡紫粉背景、白色圆角面板、黑色胶囊按钮，窄窗口自动重排导航。

@@ -30,6 +30,9 @@ pub mod screen;
 #[cfg(target_os = "windows")]
 pub mod secure_store;
 
+#[cfg(target_os = "windows")]
+pub mod window;
+
 /// 声明进程为 Per-Monitor v2 DPI 感知，把坐标系统一为**物理像素**。
 ///
 /// 不这么做时坐标系会混用：低级鼠标钩子的 `MSLLHOOKSTRUCT.pt` 给物理坐标，而

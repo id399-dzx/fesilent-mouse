@@ -2,7 +2,7 @@
 # macOS 构建 Mac 包，并通过 Zig 交叉构建 Windows GNU 版本。
 set -euo pipefail
 cd "$(dirname "$0")/.."
-VERSION="${1:-0.2.1}"
+VERSION="${1:-0.2.2}"
 OUT="dist/release/v${VERSION}"
 mkdir -p "$OUT"
 bash scripts/build-macos-app.sh "$VERSION"

@@ -247,16 +247,16 @@ fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
 /// 不用钥匙串（避免密码弹窗），私钥文件设 0600 权限。无配置目录时用临时身份。
 fn load_or_create_identity() -> Result<Identity, String> {
     let dir = data_dir();
-    if let Some(d) = &dir {
-        if let (Ok(c), Ok(k)) = (
+    if let Some(d) = &dir
+        && let (Ok(c), Ok(k)) = (
             std::fs::read(d.join("cert.der")),
             std::fs::read(d.join("key.der")),
-        ) && !c.is_empty()
-            && !k.is_empty()
-        {
-            tracing::info!(target: "mouseshare::app", "复用已保存的本机身份");
-            return Ok(Identity::from_der(c, k));
-        }
+        )
+        && !c.is_empty()
+        && !k.is_empty()
+    {
+        tracing::info!(target: "mouseshare::app", "复用已保存的本机身份");
+        return Ok(Identity::from_der(c, k));
     }
     let id = Identity::generate().map_err(|e| e.to_string())?;
     if let Some(d) = &dir {
@@ -1078,7 +1078,7 @@ async fn run_session<P: Platform>(
                 seq = seq.wrapping_add(1);
                 send_bounded(&mut send_stream, &Msg::from(Ping { seq, t0: 0 })).await?;
                 screen_tick += 1;
-                if screen_tick % 2 == 0
+                if screen_tick.is_multiple_of(2)
                     && let Ok(current) = platform.screen_info().and_then(|mut s| s.virtual_screen())
                     && session_safety::valid_screen(current.rect) && current.rect != own
                 {
@@ -1179,14 +1179,13 @@ async fn run_session<P: Platform>(
         tracing::warn!(target: "mouseshare::app", %error, "输入清理失败，继续释放其余状态");
     }
     conn.close();
-    if let Some(mut handle) = receiver_handle {
-        if tokio::time::timeout(std::time::Duration::from_secs(1), &mut handle)
+    if let Some(mut handle) = receiver_handle
+        && tokio::time::timeout(std::time::Duration::from_secs(1), &mut handle)
             .await
             .is_err()
-        {
-            handle.abort();
-            let _ = handle.await;
-        }
+    {
+        handle.abort();
+        let _ = handle.await;
     }
     status.set_connected(false);
     tracing::info!(target: "mouseshare::app", "会话已按安全顺序清理");

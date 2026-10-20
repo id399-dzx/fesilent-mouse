@@ -71,8 +71,10 @@ pub fn parse(argv: impl Iterator<Item = String>) -> Result<Args, ArgError> {
             "--port" => {
                 let v = take_value(&mut it, &flag)?;
                 args.port = Some(
-                    v.parse()
-                        .map_err(|_| ArgError(format!("--port 需要 1-65535 的整数，得到 {v}")))?,
+                    v.parse::<u16>()
+                        .ok()
+                        .filter(|port| *port != 0)
+                        .ok_or_else(|| ArgError(format!("--port 需要 1-65535 的整数，得到 {v}")))?,
                 );
             }
             "--log-dir" => args.log_dir = Some(take_value(&mut it, &flag)?.into()),
@@ -184,6 +186,14 @@ mod tests {
     #[test]
     fn 录制回放互斥() {
         assert!(p(&["--record", "a", "--replay", "b"]).is_err());
+    }
+
+    #[test]
+    fn 监听端口不能为零或越界_避免显示地址与随机监听不一致() {
+        for port in ["0", "65536", "-1", "bad"] {
+            assert!(p(&["--port", port]).is_err(), "应拒绝监听端口 {port}");
+        }
+        assert_eq!(p(&["--port", "55200"]).unwrap().port, Some(55200));
     }
 
     #[test]

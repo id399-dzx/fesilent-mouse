@@ -60,10 +60,10 @@ fn bind_dscp_socket(bind: SocketAddr, dscp: u8) -> io::Result<std::net::UdpSocke
     let sock = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
     sock.set_nonblocking(true)?;
     // 仅 IPv4 设 IP_TOS；非致命：标记失败不应阻断连接，仅告警。
-    if bind.is_ipv4() {
-        if let Err(e) = sock.set_tos(dscp_to_tos(dscp)) {
-            tracing::warn!(error = %e, "设置 DSCP(IP_TOS) 失败，连接继续但无 QoS 标记");
-        }
+    if bind.is_ipv4()
+        && let Err(e) = sock.set_tos(dscp_to_tos(dscp))
+    {
+        tracing::warn!(error = %e, "设置 DSCP(IP_TOS) 失败，连接继续但无 QoS 标记");
     }
     sock.bind(&bind.into())?;
     Ok(sock.into())

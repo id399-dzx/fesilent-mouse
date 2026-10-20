@@ -78,10 +78,10 @@ impl DeviceCatalog {
             if record.name.trim().is_empty() {
                 return Err("设备名称不能为空。".into());
             }
-            if let Some(address) = &record.address {
-                if normalize_peer_address(address)?.is_none() {
-                    return Err("设备地址留空时请使用自动发现，不要保存空地址。".into());
-                }
+            if let Some(address) = &record.address
+                && normalize_peer_address(address)?.is_none()
+            {
+                return Err("设备地址留空时请使用自动发现，不要保存空地址。".into());
             }
             if let Some(placement) = record.placement {
                 Placement::from(placement)

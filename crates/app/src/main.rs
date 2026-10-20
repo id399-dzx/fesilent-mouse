@@ -20,6 +20,7 @@ mod logging;
 mod record;
 mod selftest;
 mod session_safety;
+mod single_instance;
 mod status;
 mod transfers;
 mod ui;
@@ -55,7 +56,7 @@ fn main() -> ExitCode {
 
     // 隔离预览先于所有副作用入口：不初始化文件日志，也不能意外进入自检、录制或 daemon。
     if ui::ui_preview_enabled() {
-        return if ui::run(args) {
+        return if ui::run(args, None, None) {
             ExitCode::SUCCESS
         } else {
             ExitCode::FAILURE
@@ -70,6 +71,31 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         };
     }
+
+    // GUI 单实例必须先于日志、配置和输入后台。守卫保留到整个 GUI 调用返回，
+    // 重复启动只通知原窗口，不产生第二份托盘、日志写入器或 QUIC/输入会话。
+    let mut instance_guard = if single_instance::protects_gui(&args) {
+        match single_instance::acquire_or_activate() {
+            Ok(single_instance::Launch::Primary(guard)) => Some(guard),
+            Ok(single_instance::Launch::Activated) => return ExitCode::SUCCESS,
+            Err(error) => {
+                #[cfg(target_os = "windows")]
+                ms_platform_windows::window::show_startup_error(&format!(
+                    "无法打开 Fesilent Mouse：{error}"
+                ));
+                eprintln!("无法启动工作空间：{error}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
+    let instance_accepting = instance_guard
+        .as_ref()
+        .map(single_instance::InstanceGuard::activation_accepting);
+    let activation_receiver = instance_guard
+        .as_mut()
+        .and_then(single_instance::InstanceGuard::take_activation_receiver);
 
     let log_dir = args
         .log_dir
@@ -114,17 +140,8 @@ fn main() -> ExitCode {
         };
     }
 
-    // 托盘 UI 模式：托盘 + egui 设置窗口（图形化启停 + 全部设置）
-    if args.tray {
-        return if ui::run(args) {
-            ExitCode::SUCCESS
-        } else {
-            ExitCode::FAILURE
-        };
-    }
-
-    // 守护进程模式：监听或连接对端，运行互控主循环
-    if args.serve || args.connect.is_some() {
+    // headless/回环必须真正不进入GUI，不能仅绕过实例锁后再创建额外窗口。
+    if !single_instance::protects_gui(&args) {
         return if daemon::run(&args) {
             ExitCode::SUCCESS
         } else {
@@ -132,8 +149,8 @@ fn main() -> ExitCode {
         };
     }
 
-    // 无显式 CLI 模式（含双击 .app / 裸运行）：默认启动托盘 UI
-    if ui::run(args) {
+    // 普通双击和显式 --tray 共用同一GUI分支，保证实例判定与实际执行一致。
+    if ui::run(args, activation_receiver, instance_accepting) {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
