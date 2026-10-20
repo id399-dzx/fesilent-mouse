@@ -51,5 +51,7 @@ Windows检查基于交叉构建、资源和自动回归，不能代替真实Wind
 
 `dist/release/v0.2.2/`中包含Windows EXE、Apple Silicon Mac ZIP和SHA256SUMS，尚未上传GitHub。
 
+后续F-1018：用户要求更新GitHub，v0.2.2预览版已于2026-10-20公开，默认main同步源码。原开发阶段的本地验收记录保留，发布/下载验证见`FESILENT-RELEASE-v0.2.2-VERIFY.md`。
+
 - Mac ZIP SHA256：`35afcc29600346cd8e16cb3a5d1c52c882f0ded23d7bfdb287bcf6ba42797715`
 - Windows EXE SHA256：`f62e12706b621f779e56f9af8ae5075c28b5fcb74ae7d9c06f7cc9a7147a170a`
