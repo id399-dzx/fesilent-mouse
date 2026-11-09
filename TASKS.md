@@ -159,7 +159,7 @@
 |---|---|---|---|---|
 | F-1001 | 创建 id399-dzx/fesilent-mouse Fork，品牌与独立数据目录 | GitHub API、来源历史、版本与路径检查 | 已完成 | 保留上游归属与无许可证声明，未追加授权 |
 | F-1002 | 原生浅色设置 UI、分组导航、连接应用与错误提示 | Windows 实际启动与交互、双平台编译、fmt/clippy/tests | 进行中 | 首版已完成，等待 CI 与真机窗口检查；Mac 辅助功能和双机体验另记人工 |
-| F-1003 | Windows/MSVC 与 Apple Silicon Mac 自动构建 | Actions 全部门槛与工件校验 | 进行中 | 首次构建准备中 |
+| F-1003 | Windows/MSVC 与 Apple Silicon Mac 自动构建 | Actions 全部门槛与工件校验 | 已完成 | v0.2.3默认分支CI42556057121格式、Windows/MSVC及Mac ARM64全绿；两端原生构建/打包、workspace测试与严格Clippy通过。Windows runner实际包结构/SHA/安全loader验证通过，两系统工件已上传且未过期。本次修复中文输出编码后闭合旧待办；不等同Windows物理UI或双机体验验收。 |
 | F-1004 | 官网同风格设备工作台：真实设备排列与四向拖拽、连接阶段、首次配对确认与解除配对、轻量传输入口与手感预设 | fmt / Clippy / workspace tests / 原生构建；隔离预览检查 Windows 与 Mac 布局；双真机互控待人工 | 待人工 | 实现及自动检查完成：210通过/0失败/9原有忽略；macOS ARM64与Windows x64 GNU release构建、Mac签名与产物校验通过。原生隔离预览已检查两端页面、四向按钮/拖拽、手感预设和窄窗重排；真实双机互控/权限/重新配对待H-2/H-5按 docs/FESILENT-UI-VERIFY.md 回归。UI采用官网风格，纯egui、无新依赖、协议及配置schema不变；产物在dist，未发布。 |
 | F-1005 | Deskflow 对比建议1：捕获健康/权限/睡眠/显示变化接线、安全清理及故障回归 | fmt / strict Clippy / workspace tests / 双平台编译；故障注入；H-2/H-5真机矩阵 | 待人工 | 平台修复、统一清理、心跳/屏幕/权限/电源接线、半帧取消回归、注入marker、包校验已实现。全批255通过0失败9原有忽略，包验证5项；本机/WinGNU全app严格Clippy、双平台release及SHA通过。H-2/H-5按docs/FESILENT-OPTIMIZATION-VERIFY.md撤权/睡醒/显示/UAC回退验收；平台基础单独提交，应用接线随F-1006整合。 |
 | F-1006 | 建议2：临时锁定、可配置切换快捷键、重试倒计时和首次连接引导 | 核心/配置/状态单测，原生隔离预览，双平台构建 | 待人工 | 快捷键真实接入会话，重复键抑制、实际物理前缀释放、临时锁定/仲裁/退出清理、首连引导与状态完成；上述全套门槛通过。原生隔离预览已验证锁定/快捷键选择/Mac主控布局。仍待H-2/H-5双端实际组合键、长按及返回；不把预览当真机。 |
@@ -189,5 +189,5 @@
 | F-1022 | 精确滚动保留小数与平台整数余量 | 核心精确/普通滚轮、双轴/方向切换/模式切换/释放重置回归；Mac本机与Windows编译；[HUMAN H-2/H-5]触控板双机体验 | 待人工 | 实现/自动验收完成：先复现1.5×精密0.25误输出0，修后每帧0.375；新增9回归，整合293测试通过0失败9原忽略、双端严格Clippy/release通过。普通滚轮语义保留，平台每轴余量仅精密模式累积且释放清空。待H-2/H-5按docs/FESILENT-SCROLL-PRECISION.md验证慢滑/快滑/横向/反转、普通滚轮及暂停切换后首帧；不声称完整手势。 |
 | F-1023 | 真正多设备常驻连接与单输入焦点改造 | 持键切换/非焦点拒绝/迟到流/配对并发/三端回环故障注入；[HUMAN H-2]三台真机 | 待办 | 设计已完成于docs/FESILENT-MULTIPEER-DESIGN.md：唯一捕获/注入、逐peer心跳/重连/代数、串行配对写信任、非焦点ReleaseAll过滤、剪贴板最终写回令牌，现协议释放屏障须先验证。尚未改造网络运行时，不能直接并发run_session；不宣称Oink全组焦点。 |
 | F-1024 | Windows/macOS 原生跨屏文件拖拽 | Explorer/Finder原生文件生命周期、目录/取消/中断；[HUMAN H-2/H-5]真机 | 待办 | 需独立平台集成批次；现有复制粘贴传输继续保留。 |
-| F-1025 | 发布v0.2.3优化预览版至GitHub | 版本/源码/双包结构与SHA；fmt/双端严格Clippy/workspace测试；GitHub资产digest与公开下载 | 进行中 | 用户明确要求更新GitHub及本地；保留远程CI与旧发布，公开Mac继续ad-hoc未公证，Windows未签名，精确记录预览边界。 |
+| F-1025 | 发布v0.2.3优化预览版至GitHub | 版本/源码/双包结构与SHA；fmt/双端严格Clippy/workspace测试；GitHub资产digest与公开下载 | 已完成 | 已公开v0.2.3，三资产uploaded、GitHub大小/digest与本地一致；公开重新下载全部HTTP200且逐字节/SHA一致。tag0d0cb5d应用源匹配514c065，沿用远程CI、排除design，无force/旧包覆盖。公开Mac清除开发证书残留后重新ad-hoc且未公证；本机包签名另保留。默认分支修复Windows中文校验输出误失败后，CI42556057121双平台及格式任务全绿（含Win原生MSVC打包/测试/Clippy），本地293测试/9原忽略、36脚本测试通过，详见docs/FESILENT-RELEASE-v0.2.3-VERIFY.md。 |
 | F-1026 | 当前Mac更新至v0.2.3并保留授权身份 | 旧App备份、同证书/旧签名要求匹配、同源代码、安装路径/版本/重开UI与AX状态 | 已完成 | 已备份旧App与数据，固定原证书，新包满足旧DR且与公开包去签名代码一致；暂停旧会话完成安全清理后替换。新进程首次trusted=true，真实UI0.2.3且原设备重连RTT8ms；身份/信任不变、原配置值不变，仅新增默认空方案。未重置TCC，未整机重启或冒称滚轮真机验收，详见docs/FESILENT-MAC-INSTALL-v0.2.3.md。 |
