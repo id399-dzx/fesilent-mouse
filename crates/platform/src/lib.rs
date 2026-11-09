@@ -4,6 +4,7 @@
 //! ms-platform-windows / ms-platform-macos。坐标与键码约定见 SPEC.md §8：
 //! 左上原点、y 向下、f64 物理像素；键码统一 USB HID Usage ID（page 0x07）。
 
+pub mod scroll;
 pub mod stub;
 pub mod synthetic;
 

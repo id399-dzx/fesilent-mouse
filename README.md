@@ -4,6 +4,14 @@
 
 基于 [Yujay-Z/MouseShare](https://github.com/Yujay-Z/MouseShare) 的原生 Rust / egui 工具。本 Fork 保留上游核心与作者历史，重新设计设置界面，并改进连接配置体验。来源和权利边界见 [NOTICE.md](NOTICE.md)，上游原说明见 [docs/UPSTREAM-README.md](docs/UPSTREAM-README.md)。
 
+## 0.2.3 的更新
+
+- 新增命名布局方案：保存、更新、恢复和删除设备方位、偏移与连接目标；恢复使用最新地址，不重新加入已移除设备。
+- 修复精密滚动在倍率调整及系统整数边界丢失小幅位移的问题，普通滚轮行为保持一致。
+- 完善Mac辅助功能授权恢复提示及稳定签名构建，增加正式分发的签名、公证检查工具。
+
+[下载 v0.2.3 预览版](https://github.com/id399-dzx/fesilent-mouse/releases/tag/v0.2.3)：Windows x64 免安装 EXE 与 Apple Silicon Mac ZIP，附 SHA256SUMS。Windows未签名，公开Mac包为ad-hoc签名、未经Apple公证；正式分发工具就绪不表示本预览包已公证。仍每次一台活动连接，原生跨屏文件拖拽尚未提供。
+
 ## 0.2.1 的更新
 
 - 使用新的黑白品牌图标，覆盖 Windows EXE、主窗口、Mac Dock 及菜单栏/托盘。

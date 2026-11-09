@@ -171,6 +171,9 @@ pub struct Config {
     pub onboarding_done: bool,
     #[serde(default)]
     pub devices: crate::devices::DeviceCatalog,
+    /// 命名设备布局；只保存身份、相邻方位/偏移和连接目标，不保存信任或旧地址。
+    #[serde(default)]
+    pub layout_profiles: Vec<crate::layout_profiles::LayoutProfile>,
     /// 反转滚轮上下方向。
     #[serde(default)]
     pub invert_scroll: bool,
@@ -215,6 +218,7 @@ impl Default for Config {
             lock_shortcut: default_lock_shortcut(),
             onboarding_done: false,
             devices: crate::devices::DeviceCatalog::default(),
+            layout_profiles: Vec::new(),
             invert_scroll: false,
             scroll_speed: default_scroll_speed(),
             swap_modifiers: true,

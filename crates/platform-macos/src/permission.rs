@@ -5,6 +5,10 @@
 //! 列表并弹系统提示，便于用户直接在列表里勾选。
 
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicU8, Ordering};
+
+// 只记录首次查询和真实变化，不把每帧检查刷进日志，也不缓存系统的授权结果。
+static LAST_TRUST: AtomicU8 = AtomicU8::new(0);
 
 type CFStringRef = *const c_void;
 type CFDictionaryRef = *const c_void;
@@ -35,7 +39,13 @@ unsafe extern "C" {
 /// 当前进程是否已获辅助功能授权。
 pub fn is_trusted() -> bool {
     // SAFETY: 无参数的纯查询，无副作用
-    unsafe { AXIsProcessTrusted() }
+    let trusted = unsafe { AXIsProcessTrusted() };
+    let state = if trusted { 2 } else { 1 };
+    if LAST_TRUST.swap(state, Ordering::Relaxed) != state {
+        tracing::info!(target: "mouseshare::mac", trusted, executable = ?std::env::current_exe().ok(),
+            "macOS 辅助功能授权状态（系统 API 实时查询）");
+    }
+    trusted
 }
 
 /// 触发系统授权提示：把本应用加入「辅助功能」列表并弹出系统提示，随后打开设置页，

@@ -16,6 +16,7 @@ mod config;
 mod daemon;
 mod devices;
 mod diag;
+mod layout_profiles;
 mod logging;
 mod record;
 mod selftest;

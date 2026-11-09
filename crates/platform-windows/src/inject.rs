@@ -6,6 +6,7 @@
 
 use std::collections::BTreeSet;
 
+use ms_platform::scroll::ScrollAccumulator;
 use ms_platform::synthetic::OWN_EVENT_MARKER;
 use ms_platform::{Button, HidKey, InputInject, Result};
 
@@ -32,6 +33,7 @@ const XBUTTON2: i32 = 2;
 pub struct WinInject {
     keys: BTreeSet<u16>,
     buttons: BTreeSet<u8>,
+    scroll: ScrollAccumulator,
 }
 
 impl WinInject {
@@ -39,6 +41,7 @@ impl WinInject {
         Self {
             keys: BTreeSet::new(),
             buttons: BTreeSet::new(),
+            scroll: ScrollAccumulator::default(),
         }
     }
 }
@@ -205,27 +208,21 @@ impl InputInject for WinInject {
         Ok(())
     }
 
-    fn scroll(&mut self, dx: f64, dy: f64, _precise: bool) -> Result<()> {
-        if dy != 0.0 {
-            send(&[mouse_input(
-                MOUSEEVENTF_WHEEL,
-                0,
-                0,
-                (dy * WHEEL_DELTA as f64).round() as i32,
-            )])?;
+    fn scroll(&mut self, dx: f64, dy: f64, precise: bool) -> Result<()> {
+        let (dx, dy) = self
+            .scroll
+            .quantize(dx, dy, precise, f64::from(WHEEL_DELTA));
+        if dy != 0 {
+            send(&[mouse_input(MOUSEEVENTF_WHEEL, 0, 0, dy)])?;
         }
-        if dx != 0.0 {
-            send(&[mouse_input(
-                MOUSEEVENTF_HWHEEL,
-                0,
-                0,
-                (dx * WHEEL_DELTA as f64).round() as i32,
-            )])?;
+        if dx != 0 {
+            send(&[mouse_input(MOUSEEVENTF_HWHEEL, 0, 0, dx)])?;
         }
         Ok(())
     }
 
     fn release_all(&mut self) -> Result<()> {
+        self.scroll.reset();
         let keys_result = release_pending(&mut self.keys, |hid| {
             if let Some((sc, ext)) = hid_to_scancode(HidKey(hid)) {
                 send(&[key_input(sc, ext, false)])

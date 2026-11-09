@@ -473,7 +473,7 @@ impl Engine {
             }
             InputEvent::Scroll { dx, dy, precise } => {
                 // 倍率只决定纵向滚动量，反转只决定最终符号；横向始终原样发送。
-                let scaled_dy = self.scroll_scaler.scale_vertical(dy);
+                let scaled_dy = self.scroll_scaler.scale_vertical(dy, precise);
                 let dy = if self.invert_scroll {
                     -scaled_dy
                 } else {
@@ -633,7 +633,14 @@ impl ScrollScaler {
         self.last_direction = 0;
     }
 
-    fn scale_vertical(&mut self, dy: f64) -> f64 {
+    fn scale_vertical(&mut self, dy: f64, precise: bool) -> f64 {
+        // 精密滚动的每帧小数就是有效位移，不能在网络发送前量化为整格。
+        // 两种输入设备切换时不继承普通滚轮的倍率余量；最终整数换算由平台端累积。
+        if precise {
+            self.reset();
+            let scaled = dy * self.factor;
+            return if scaled.is_finite() { scaled } else { 0.0 };
+        }
         if dy == 0.0 {
             return 0.0;
         }
@@ -1254,7 +1261,7 @@ mod tests {
                 let out = a.feed_local(InputEvent::Scroll {
                     dx: 0.25,
                     dy: 1.0,
-                    precise: true,
+                    precise: false,
                 });
                 let scroll = out.to_peer.iter().find_map(|m| match m {
                     Msg::Scroll(s) => Some(s),
@@ -1262,10 +1269,48 @@ mod tests {
                 });
                 let scroll = scroll.expect("每次普通滚轮输入都应立即输出");
                 assert_eq!(scroll.dx, 0.25, "横向不得应用倍率");
-                assert!(scroll.precise, "precise 标志应保持");
+                assert!(!scroll.precise, "普通滚轮标志应保持");
                 sum += scroll.dy;
             }
             assert_eq!(sum, step as f32, "{factor:.1}× 累计量错误");
+        }
+    }
+
+    #[test]
+    fn 精密滚动在倍率调整后仍逐帧保留小数位移() {
+        let mut a = remote_engine_invert(false);
+        a.set_scroll_speed(1.5);
+        for _ in 0..8 {
+            let out = a.feed_local(InputEvent::Scroll {
+                dx: 0.125,
+                dy: 0.25,
+                precise: true,
+            });
+            let scroll = out
+                .to_peer
+                .iter()
+                .find_map(|message| match message {
+                    Msg::Scroll(scroll) => Some(scroll),
+                    _ => None,
+                })
+                .expect("精密滚动的小数位移不能被整格量化吞掉");
+            assert_eq!(scroll.dx, 0.125);
+            assert_eq!(scroll.dy, 0.375);
+            assert!(scroll.precise);
+        }
+    }
+
+    #[test]
+    fn 普通与精密滚动切换不继承倍率余量() {
+        let mut a = remote_engine_invert(false);
+        a.set_scroll_speed(1.5);
+        for (precise, dy, expected) in [(false, 1.0, 1.0), (true, 0.25, 0.375), (false, 1.0, 1.0)] {
+            let out = a.feed_local(InputEvent::Scroll {
+                dx: 0.0,
+                dy,
+                precise,
+            });
+            assert_eq!(sent_scroll_dy(&out), expected);
         }
     }
 

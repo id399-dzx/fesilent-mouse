@@ -6,6 +6,7 @@
 
 use std::ffi::c_void;
 
+use ms_platform::scroll::ScrollAccumulator;
 use ms_platform::synthetic::OWN_EVENT_MARKER;
 use ms_platform::{Button, HidKey, InputInject, PlatformError, Result};
 
@@ -211,6 +212,7 @@ pub struct MacInject {
     /// 因协议未携带 clickCount）。按下时更新，对应的抬起复用同一计数。
     last_click: Option<(Button, std::time::Instant, CGPoint)>,
     click_count: i64,
+    scroll: ScrollAccumulator,
 }
 
 // CGEventSourceRef 为不可变的 CF 对象指针，注入器自身在单线程使用（核心层串行调用），
@@ -235,6 +237,7 @@ impl MacInject {
             drag: None,
             last_click: None,
             click_count: 0,
+            scroll: ScrollAccumulator::default(),
         })
     }
 
@@ -434,8 +437,10 @@ impl InputInject for MacInject {
             SCROLL_UNIT_LINE
         };
         // wheel1=纵向（向上为正），wheel2=横向
-        let w1 = dy.round() as i32;
-        let w2 = dx.round() as i32;
+        let (w2, w1) = self.scroll.quantize(dx, dy, precise, 1.0);
+        if w1 == 0 && w2 == 0 {
+            return Ok(());
+        }
         // SAFETY: 变参调用，wheel_count=2 对应随后两个 i32 实参
         unsafe {
             let ev = CGEventCreateScrollWheelEvent(self.source, unit, 2, w1, w2);
@@ -449,6 +454,7 @@ impl InputInject for MacInject {
     }
 
     fn release_all(&mut self) -> Result<()> {
+        self.scroll.reset();
         let (keys, buttons) = self.tracker.drain_pressed();
         for key in keys {
             // 抬起修饰键时同步清除其 flags，使递减后的 up 事件 flags 正确，最终归 0

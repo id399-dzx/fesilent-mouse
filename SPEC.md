@@ -1,6 +1,6 @@
 # Fesilent Mouse 工程契约（SPEC）
 
-> **Fork 修订（2026-10-19，用户要求更名与 UI 优化）**：下文保留上游历史契约便于溯源。当前显示名为 `Fesilent Mouse`，可执行文件名为 `fesilent-mouse`，版本 `0.2.2`，macOS bundle id 为 `com.fesilent.mouse`。配置、设备身份、日志、接收文件与开机自启标识使用 `FesilentMouse`，不覆盖上游目录。Windows 默认用户安装位置为 `%LOCALAPPDATA%\Programs\FesilentMouse\`，也可直接运行免安装 EXE。crate 名、协议版本、UDP 53728、mDNS 类型和消息格式沿用上游。手动连接只接受局域网 IPv4 或 `IPv4:端口`，裸 IPv4 自动补 53728；非法地址在启动前拒绝。当前目录与 UI 设计详见 `docs/FESILENT-UI.md`。
+> **Fork 修订（2026-10-19，用户要求更名与 UI 优化）**：下文保留上游历史契约便于溯源。当前显示名为 `Fesilent Mouse`，可执行文件名为 `fesilent-mouse`，版本 `0.2.3`，macOS bundle id 为 `com.fesilent.mouse`。配置、设备身份、日志、接收文件与开机自启标识使用 `FesilentMouse`，不覆盖上游目录。Windows 默认用户安装位置为 `%LOCALAPPDATA%\Programs\FesilentMouse\`，也可直接运行免安装 EXE。crate 名、协议版本、UDP 53728、mDNS 类型和消息格式沿用上游。手动连接只接受局域网 IPv4 或 `IPv4:端口`，裸 IPv4 自动补 53728；非法地址在启动前拒绝。当前目录与 UI 设计详见 `docs/FESILENT-UI.md`。
 
 > 本文件固化所有跨会话必须一致的命名、常量与接口契约。
 >
@@ -8,6 +8,14 @@
 > **修改本文件中任何条目须经人确认**（见 CLAUDE.md §2），修改后需全仓搜索同步引用处。
 
 > **启动与连接修订（2026-10-20，用户要求重复启动统一窗口及自动地址/端口）**：当前开发候选版本 `0.2.2`。同一用户普通GUI启动使用应用目录内独占文件锁与鉴权loopback通知，重复启动恢复已有工作台；显式headless/回环、录制、自检和隔离预览不进入此实例范围。`config_ver:1`新增可选`port`字段，默认空表示监听UDP53728；自动显示本机物理网卡IPv4和监听端口；裸IPv4及IPv4后空冒号自动补53728，显式非零端口保留。配置路径、网络协议与已保存设备单活动会话规则不变。使用标准库文件锁，最低Rust声明1.89，无新增依赖。
+
+> **正式分发门禁（2026-11-09，用户授权Oink对比后的优化）**：正式macOS构建显式使用`FESILENT_MACOS_RELEASE=1`，仅接受Developer ID Application，启用runtime/timestamp；可固定Team ID与证书hash。分发打ZIP前须通过版本/签名/公证票据/Gatekeeper检查，已公证App用`--macos-app`复用以免重建丢票据；上传公证仅显式命令执行。开发模式保留本机Apple Development构建，不能标为正式分发。本轮候选保留0.2.2元数据，未发布或替换已安装应用。
+
+> **设备布局方案（2026-11-09，同批用户授权）**：`config_ver:1`新增默认空的`layout_profiles`，每项保存名称、完整已认证设备指纹及可选方位/偏移、可选连接目标；不保存地址、名称别名、信任或在线状态。名称1–40字符，最多20项。恢复只匹配当前设备清单，跳过已移除身份，保留新增设备及最新地址，验证整体方向冲突后一次提交，不自动复活设备/授予信任。应用时请求停止旧会话，原先启用且目标仍存在时等待旧会话完整退出后重连，传输中禁用。仍为单活动连接，不改协议或端口；真正多连接设计见`docs/FESILENT-MULTIPEER-DESIGN.md`，尚未实现。
+
+> **精密滚动修复（2026-11-09，同批用户授权）**：既有`Scroll{dx,dy,precise}`消息不变。精密滚动在核心保留小数至平台API整数边界，每轴余量在换向、模式切换或`release_all`时清空；普通滚轮沿用原有整格倍率和四舍五入。此修复不引入多指手势、惯性阶段或新消息。
+
+> **v0.2.3预览分发与本机更新（2026-11-09，用户明确要求更新GitHub及本地）**：当前版本更新为`0.2.3`。公开Windows包未作Authenticode签名，公开Mac包继续使用ad-hoc且未公证，不称正式签名发行；正式Developer ID/公证门禁保持启用条件不变。本机安装同源代码的独立包，固定当前已授权安装的签名证书，并验证满足旧designated requirement，避免换成公开ad-hoc包导致本机授权身份变化。保留旧包备份、用户配置/身份和旧GitHub资产；不自动重置TCC或代授予权限。
 
 ## 1. 命名与标识
 

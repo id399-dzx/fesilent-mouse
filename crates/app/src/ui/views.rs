@@ -7,6 +7,8 @@ use ms_core::control::ControlState;
 
 #[path = "device_catalog.rs"]
 mod device_catalog;
+#[path = "layout_profiles.rs"]
+mod layout_profiles;
 #[path = "local_network.rs"]
 mod local_network;
 #[path = "theme.rs"]
@@ -458,11 +460,19 @@ impl App {
         let phase = self.handle.status.phase();
         let permission = daemon::input_permission_granted();
         let needs_permission = self.is_mac_ui() && !permission && !self.ui_preview;
+        let ready_to_retry =
+            permission_ready_to_retry(self.is_mac_ui(), permission, running, phase);
         let (title, detail, color) = if needs_permission {
             (
                 "需要辅助功能权限".to_owned(),
                 "在这台 Mac 上允许 Fesilent Mouse 控制键盘与鼠标。".to_owned(),
                 AMBER,
+            )
+        } else if ready_to_retry {
+            (
+                "辅助功能授权已就绪".to_owned(),
+                "点击重新连接，恢复键鼠共享。".to_owned(),
+                GREEN,
             )
         } else if self.handle.status.connected() && running {
             let control = if self.handle.status.local_locked() {
@@ -564,7 +574,7 @@ impl App {
                         } else {
                             "取消连接"
                         }
-                    } else if self.handle.status.last_error().is_some() {
+                    } else if ready_to_retry || self.handle.status.last_error().is_some() {
                         "重新连接"
                     } else if self.is_mac_ui() {
                         "等待对端接入"
@@ -616,7 +626,11 @@ impl App {
                     });
                 }
             });
-            if let Some(error) = self.handle.status.last_error() {
+            if needs_permission {
+                ui.add_space(7.0);
+                ui.label(RichText::new("开关已开启但仍提示？先完整退出软件，在辅助功能列表中移除旧条目，再添加“应用程序”中的 Fesilent Mouse 并开启权限，随后重新打开软件。").small().color(MUTED));
+            }
+            if !ready_to_retry && let Some(error) = self.handle.status.last_error() {
                 ui.add_space(7.0);
                 ui.label(RichText::new(error).small().color(ERROR));
             }
@@ -709,6 +723,8 @@ impl App {
         self.draw_connection_details(ui, cfg);
         ui.add_space(15.0);
         self.draw_device_catalog(ui, cfg, dirty);
+        ui.add_space(15.0);
+        self.draw_layout_profiles(ui, cfg, dirty);
     }
 
     fn draw_local_connection_addresses(&mut self, ui: &mut egui::Ui, cfg: &Config) {
@@ -1624,6 +1640,16 @@ impl App {
     }
 }
 
+// 只改变已停止会话的展示；不自动连接、不修改后台错误，也不放宽输入权限检查。
+fn permission_ready_to_retry(
+    is_mac: bool,
+    granted: bool,
+    running: bool,
+    phase: ConnectionPhase,
+) -> bool {
+    is_mac && granted && !running && phase == ConnectionPhase::PermissionRequired
+}
+
 fn shortcut_editor(
     ui: &mut egui::Ui,
     label: &str,
@@ -1762,4 +1788,26 @@ fn draw_screen(
 
 pub(super) fn spawn_local_ip_monitor() -> std::sync::mpsc::Receiver<Vec<String>> {
     local_network::monitor()
+}
+
+#[cfg(test)]
+mod permission_tests {
+    use super::*;
+
+    #[test]
+    fn 授权恢复只展示重新连接且不掩盖其他错误() {
+        let phase = ConnectionPhase::PermissionRequired;
+        assert!(!permission_ready_to_retry(true, false, false, phase));
+        assert!(permission_ready_to_retry(true, true, false, phase));
+        assert!(!permission_ready_to_retry(true, false, false, phase));
+        assert!(!permission_ready_to_retry(true, true, true, phase));
+        assert!(!permission_ready_to_retry(false, true, false, phase));
+        for phase in [
+            ConnectionPhase::Failed,
+            ConnectionPhase::Connected,
+            ConnectionPhase::Idle,
+        ] {
+            assert!(!permission_ready_to_retry(true, true, false, phase));
+        }
+    }
 }
