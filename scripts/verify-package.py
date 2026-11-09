@@ -147,6 +147,11 @@ def verify_macos_zip(artifact, smoke):
 
 
 def main():
+    # Windows重定向输出可能使用cp1252等旧编码；无法表示的中文仅转义显示，
+    # 不能让成功/失败提示的编码异常改变包校验结果。保留终端现有编码。
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="backslashreplace")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--kind", choices=["windows", "macos"], required=True)
     parser.add_argument("--artifact", type=Path, required=True)

@@ -2,8 +2,11 @@
 
 import hashlib
 import importlib.util
+import os
 from pathlib import Path
 import struct
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -33,6 +36,34 @@ def pe_fixture():
 
 
 class PackageChecks(unittest.TestCase):
+    def run_legacy_console(self, data):
+        scratch = Path(__file__).resolve().parents[1] / "target/package-checks"
+        scratch.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="console-", dir=scratch) as folder:
+            binary = Path(folder) / "测试包.exe"
+            manifest = Path(folder) / "SHA256SUMS"
+            binary.write_bytes(data)
+            manifest.write_text(hashlib.sha256(data).hexdigest() + "  " + binary.name + "\n", encoding="utf-8")
+            env = os.environ.copy()
+            env["PYTHONIOENCODING"] = "cp1252:strict"
+            return subprocess.run(
+                [sys.executable, "-B", str(Path(__file__).with_name("verify-package.py")),
+                 "--kind", "windows", "--artifact", str(binary), "--checksums", str(manifest)],
+                env=env, capture_output=True, timeout=10,
+            )
+
+    def test_valid_package_succeeds_in_legacy_windows_console_with_chinese_path(self):
+        result = self.run_legacy_console(bytes(pe_fixture()))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(result.stdout)
+        self.assertNotIn(b"Traceback", result.stdout + result.stderr)
+
+    def test_invalid_package_still_fails_cleanly_in_legacy_windows_console(self):
+        result = self.run_legacy_console(b"not a Windows executable")
+        self.assertEqual(result.returncode, 1)
+        self.assertTrue(result.stderr)
+        self.assertNotIn(b"Traceback", result.stdout + result.stderr)
+
     def test_windows_x64_gui_and_icon_resources(self):
         package.verify_pe(pe_fixture())
 
